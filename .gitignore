@@ -23,6 +23,10 @@ Thumbs.db
 *.tmp
 *.temp
 
+# 桥接服务运行时文件
+**/.service.lock
+test-output/*-session_*/
+
 # Excel和XMind产物（可选保留）
 # *.xlsx
 # *.xmind

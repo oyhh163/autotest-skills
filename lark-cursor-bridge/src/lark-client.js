@@ -1,0 +1,571 @@
+/**
+ * 飞书客户端封装
+ * 
+ * 提供：
+ * - 消息发送
+ * - 交互卡片发送（支持更新）
+ * - 多维表格操作
+ */
+
+const lark = require('@larksuiteoapi/node-sdk');
+const { config } = require('./config');
+const fs = require('fs');
+const path = require('path');
+
+let client = null;
+
+// 存储每个会话的进度卡片消息ID，用于更新而非重复发送
+const progressCardIds = new Map();
+
+function initLarkClient() {
+  if (!client) {
+    client = new lark.Client({
+      appId: config.lark.appId,
+      appSecret: config.lark.appSecret,
+      disableTokenCache: false,
+    });
+  }
+  return client;
+}
+
+/**
+ * 获取或设置进度卡片消息ID
+ */
+function getProgressCardId(chatId) {
+  return progressCardIds.get(chatId);
+}
+
+function setProgressCardId(chatId, messageId) {
+  progressCardIds.set(chatId, messageId);
+}
+
+function clearProgressCardId(chatId) {
+  progressCardIds.delete(chatId);
+}
+
+/**
+ * 下载消息中的图片，保存到本地，返回文件路径
+ * @param {string} messageId - 消息ID
+ * @param {string} imageKey - 图片key（image_key）
+ * @returns {Promise<string|null>} 本地文件路径
+ */
+async function downloadMessageImage(messageId, imageKey) {
+  const cli = initLarkClient();
+  
+  // 输出目录
+  const outDir = path.join(config.testSystem.outputPath, 'requirement-images');
+  if (!fs.existsSync(outDir)) {
+    fs.mkdirSync(outDir, { recursive: true });
+  }
+  const filePath = path.join(outDir, `${imageKey}.png`);
+  
+  try {
+    const resp = await cli.im.messageResource.get({
+      path: { message_id: messageId, file_key: imageKey },
+      params: { type: 'image' },
+    });
+    
+    // SDK 文件响应提供 writeFile 方法
+    if (resp && typeof resp.writeFile === 'function') {
+      await resp.writeFile(filePath);
+      return filePath;
+    }
+    
+    // 兜底：尝试从可读流写入
+    if (resp && typeof resp.getReadableStream === 'function') {
+      await new Promise((resolve, reject) => {
+        const ws = fs.createWriteStream(filePath);
+        resp.getReadableStream().pipe(ws);
+        ws.on('finish', resolve);
+        ws.on('error', reject);
+      });
+      return filePath;
+    }
+    
+    console.error('图片响应格式未知，无法保存');
+    return null;
+  } catch (error) {
+    console.error('下载图片失败:', error?.message || error);
+    return null;
+  }
+}
+
+/**
+ * 发送文本消息
+ */
+async function sendTextMessage(chatId, text) {
+  const cli = initLarkClient();
+  return await cli.im.message.create({
+    data: {
+      receive_id: chatId,
+      msg_type: 'text',
+      content: JSON.stringify({ text }),
+    },
+    params: {
+      receive_id_type: 'chat_id',
+    },
+  });
+}
+
+/**
+ * 发送交互卡片（用于用户选择）
+ * 
+ * @param {string} chatId - 会话ID
+ * @param {string} title - 卡片标题
+ * @param {string} content - 卡片内容
+ * @param {Array} options - 选项数组 [{value, text}]
+ * @param {string} callbackKey - 回调标识
+ */
+async function sendInteractiveCard(chatId, title, content, options, callbackKey) {
+  const cli = initLarkClient();
+  
+  const elements = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: content || '请选择：',
+      },
+    },
+    { tag: 'hr' },
+  ];
+  
+  // 每个选项单独一行按钮（垂直排列，避免横向拥挤/截断）
+  const buttonColors = ['primary', 'default', 'default', 'default', 'default'];
+  options.forEach((opt, index) => {
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: {
+            tag: 'plain_text',
+            content: opt.text,
+          },
+          type: buttonColors[index] || 'default',
+          value: {
+            key: callbackKey || 'user_choice',
+            selected: opt.value,
+            chat_id: chatId,
+          },
+        },
+      ],
+    });
+  });
+  
+  // 备用提示：也支持回复编号
+  elements.push({
+    tag: 'note',
+    elements: [
+      {
+        tag: 'plain_text',
+        content: '💡 点击按钮选择，或直接回复选项编号（如 1）',
+      },
+    ],
+  });
+  
+  const card = {
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: title || '需要您的选择',
+      },
+      template: 'orange',
+    },
+    elements,
+  };
+  
+  try {
+    const result = await cli.im.message.create({
+      data: {
+        receive_id: chatId,
+        msg_type: 'interactive',
+        content: JSON.stringify(card),
+      },
+      params: {
+        receive_id_type: 'chat_id',
+      },
+    });
+    return result;
+  } catch (error) {
+    console.error('发送交互卡片失败:', error?.message || error);
+    // 降级为文本消息
+    const optionsList = options.map((opt, i) => `${i + 1}. ${opt.text}`).join('\n');
+    await sendTextMessage(chatId, `【${title}】\n${content}\n\n${optionsList}\n\n请回复选项编号进行选择。`);
+  }
+}
+
+/**
+ * 简化的6阶段流程
+ * 1. 初始化
+ * 2. 分析需求
+ * 3. 生成测试用例（实时进度）
+ * 4. 生成自动化用例（实时进度）
+ * 5. 执行自动化（总数/通过数）
+ * 6. 反馈Bug
+ */
+const PHASES = [
+  { key: 'init', name: '初始化', icon: '🚀' },
+  { key: 'analyze', name: '分析需求', icon: '📖' },
+  { key: 'testcase', name: '生成测试用例', icon: '📝' },
+  { key: 'autocase', name: '生成自动化用例', icon: '🤖' },
+  { key: 'execute', name: '执行自动化', icon: '▶️' },
+  { key: 'feedback', name: '反馈Bug', icon: '🐛' },
+];
+
+/**
+ * 生成文本进度条
+ * @param {number} current - 当前完成数
+ * @param {number} total - 总数
+ * @param {number} length - 进度条长度（字符数）
+ */
+function buildProgressBar(current, total, length = 12) {
+  const ratio = total > 0 ? Math.min(current / total, 1) : 0;
+  const filled = Math.round(ratio * length);
+  const empty = length - filled;
+  const percent = Math.round(ratio * 100);
+  return `${'▓'.repeat(filled)}${'░'.repeat(empty)} ${percent}%`;
+}
+
+/**
+ * 构建进度卡片内容（单张卡片：当前阶段 + 进度条）
+ */
+function buildProgressCard(progressData, chatId) {
+  const {
+    currentPhase,  // 当前阶段 key
+    phaseStatus,   // 各阶段状态
+    phaseDetails,  // 各阶段详情
+    title,
+    headerColor,
+  } = progressData;
+  
+  // 找到当前阶段信息
+  const phaseIndex = PHASES.findIndex(p => p.key === currentPhase);
+  const currentPhaseInfo = PHASES[phaseIndex] || PHASES[0];
+  const status = phaseStatus[currentPhase] || 'running';
+  const detail = phaseDetails[currentPhase] || '';
+  
+  // 阶段进度条（第几阶段 / 总阶段）
+  const allDone = Object.values(phaseStatus).every(s => s === 'done');
+  const doneCount = allDone ? PHASES.length : phaseIndex + (status === 'done' ? 1 : 0);
+  const stageBar = buildProgressBar(doneCount, PHASES.length);
+  
+  // 状态图标
+  let statusIcon = '🔄';
+  if (status === 'done') statusIcon = '✅';
+  else if (status === 'error') statusIcon = '❌';
+  else if (allDone) statusIcon = '🎉';
+  
+  // 卡片正文
+  let content = `**当前阶段**\n${statusIcon} ${currentPhaseInfo.icon} ${currentPhaseInfo.name}（第 ${phaseIndex + 1}/${PHASES.length} 步）`;
+  content += `\n\n**总进度**\n${stageBar}`;
+  if (detail) {
+    content += `\n\n**详情**\n${detail}`;
+  }
+  
+  const elements = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content,
+      },
+    },
+  ];
+  
+  // 未完成时提供停止按钮
+  if (!allDone && status !== 'error') {
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '🛑 停止流程' },
+          type: 'danger',
+          value: { action: 'stop', chat_id: chatId },
+        },
+      ],
+    });
+  }
+  
+  elements.push({
+    tag: 'note',
+    elements: [
+      {
+        tag: 'plain_text',
+        content: `更新: ${new Date().toLocaleString('zh-CN')}｜发送"停止"可随时中止`,
+      },
+    ],
+  });
+  
+  return {
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: title || '📊 测试进度',
+      },
+      template: headerColor || 'blue',
+    },
+    elements,
+  };
+}
+
+/**
+ * 从 SDK 响应中提取 message_id（兼容不同返回结构）
+ */
+function extractMessageId(result) {
+  return result?.data?.message_id 
+    || result?.message_id 
+    || result?.data?.data?.message_id 
+    || null;
+}
+
+// 每个会话的更新串行锁，防止并发导致重复建卡刷屏
+const progressUpdateLocks = new Map();
+
+/**
+ * 发送或更新进度卡片（只维护一张卡片，串行执行防止竞态）
+ */
+async function sendOrUpdateProgressCard(chatId, progressData) {
+  // 将本次更新链接到该会话的上一次更新之后，保证串行
+  const prev = progressUpdateLocks.get(chatId) || Promise.resolve();
+  const task = prev
+    .catch(() => {})
+    .then(() => doSendOrUpdateProgressCard(chatId, progressData));
+  progressUpdateLocks.set(chatId, task);
+  return task;
+}
+
+async function doSendOrUpdateProgressCard(chatId, progressData) {
+  const cli = initLarkClient();
+  const card = buildProgressCard(progressData, chatId);
+  const existingMessageId = getProgressCardId(chatId);
+  
+  try {
+    if (existingMessageId) {
+      // 更新现有卡片
+      await cli.im.message.patch({
+        path: { message_id: existingMessageId },
+        data: { content: JSON.stringify(card) },
+      });
+      return { message_id: existingMessageId, updated: true };
+    } else {
+      // 发送新卡片
+      const result = await cli.im.message.create({
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: JSON.stringify(card),
+        },
+        params: { receive_id_type: 'chat_id' },
+      });
+      
+      const messageId = extractMessageId(result);
+      if (messageId) {
+        setProgressCardId(chatId, messageId);
+      }
+      return { message_id: messageId, created: true };
+    }
+  } catch (error) {
+    console.error('发送/更新进度卡片失败:', error?.message || error);
+    // 更新失败（如消息过期），清除ID下次重新建卡
+    if (existingMessageId) {
+      clearProgressCardId(chatId);
+    }
+  }
+}
+
+/**
+ * 旧版兼容 - 发送进度卡片（不推荐使用，保留兼容）
+ */
+async function sendProgressCard(chatId, phase, status, details) {
+  // 转换为新格式
+  const phaseKey = {
+    '初始化': 'init',
+    '分析需求': 'analyze', '需求分析': 'analyze',
+    '生成测试用例': 'testcase', '测试用例生成': 'testcase',
+    '生成自动化用例': 'autocase', '自动化筛选': 'autocase',
+    '执行自动化': 'execute', 'UI自动化': 'execute',
+    '反馈Bug': 'feedback', '缺陷汇总': 'feedback',
+    '完成': 'feedback',
+  }[phase] || 'init';
+  
+  const phaseStatus = {};
+  const phaseDetails = {};
+  
+  // 设置已完成的阶段
+  const phaseOrder = ['init', 'analyze', 'testcase', 'autocase', 'execute', 'feedback'];
+  const currentIndex = phaseOrder.indexOf(phaseKey);
+  
+  phaseOrder.forEach((key, index) => {
+    if (index < currentIndex) {
+      phaseStatus[key] = 'done';
+    } else if (index === currentIndex) {
+      phaseStatus[key] = status === 'success' ? 'done' : (status === 'error' ? 'error' : 'running');
+      if (details) phaseDetails[key] = details;
+    } else {
+      phaseStatus[key] = 'pending';
+    }
+  });
+  
+  const headerColor = status === 'success' ? 'green' : (status === 'error' ? 'red' : 'blue');
+  
+  return sendOrUpdateProgressCard(chatId, {
+    currentPhase: phaseKey,
+    phaseStatus,
+    phaseDetails,
+    headerColor,
+  });
+}
+
+/**
+ * 更新卡片消息
+ */
+async function updateCard(messageId, card) {
+  const cli = initLarkClient();
+  
+  return await cli.im.message.patch({
+    path: {
+      message_id: messageId,
+    },
+    data: {
+      content: JSON.stringify(card),
+    },
+  });
+}
+
+/**
+ * 在多维表格中创建Bug记录
+ */
+async function createBugRecord(bugData) {
+  const cli = initLarkClient();
+  
+  if (!config.bugTable.baseToken || !config.bugTable.tableId) {
+    console.warn('Bug记录表格未配置，跳过记录');
+    return null;
+  }
+  
+  return await cli.bitable.appTableRecord.create({
+    path: {
+      app_token: config.bugTable.baseToken,
+      table_id: config.bugTable.tableId,
+    },
+    data: {
+      fields: {
+        '标题': bugData.title,
+        '描述': bugData.description,
+        '严重程度': bugData.severity || 'P2',
+        '状态': '待处理',
+        '发现时间': new Date().toISOString(),
+        '测试用例': bugData.testCase || '',
+        '复现步骤': bugData.steps || '',
+        '预期结果': bugData.expected || '',
+        '实际结果': bugData.actual || '',
+      },
+    },
+  });
+}
+
+/**
+ * 批量创建Bug记录
+ */
+async function createBugRecords(bugs) {
+  const results = [];
+  for (const bug of bugs) {
+    try {
+      const result = await createBugRecord(bug);
+      results.push({ success: true, bug, result });
+    } catch (error) {
+      results.push({ success: false, bug, error: error.message });
+    }
+  }
+  return results;
+}
+
+/**
+ * 发送Bug汇总卡片
+ */
+async function sendBugSummaryCard(chatId, bugs, baseUrl) {
+  const cli = initLarkClient();
+  
+  const bugList = bugs.map((bug, i) => 
+    `${i + 1}. **${bug.title}** (${bug.severity || 'P2'})`
+  ).join('\n');
+  
+  const card = {
+    config: {
+      wide_screen_mode: true,
+    },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `🐛 发现 ${bugs.length} 个问题`,
+      },
+      template: bugs.length > 0 ? 'red' : 'green',
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: bugs.length > 0 ? bugList : '✅ 未发现问题',
+        },
+      },
+    ],
+  };
+  
+  if (baseUrl) {
+    card.elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: {
+            tag: 'plain_text',
+            content: '查看Bug表格',
+          },
+          type: 'default',
+          url: baseUrl,
+        },
+      ],
+    });
+  }
+  
+  return await cli.im.message.create({
+    data: {
+      receive_id: chatId,
+      msg_type: 'interactive',
+      content: JSON.stringify(card),
+    },
+    params: {
+      receive_id_type: 'chat_id',
+    },
+  });
+}
+
+module.exports = {
+  initLarkClient,
+  downloadMessageImage,
+  sendTextMessage,
+  sendInteractiveCard,
+  sendProgressCard,
+  sendOrUpdateProgressCard,
+  updateCard,
+  createBugRecord,
+  createBugRecords,
+  sendBugSummaryCard,
+  // 进度卡片管理
+  getProgressCardId,
+  setProgressCardId,
+  clearProgressCardId,
+  // 常量
+  PHASES,
+};

@@ -1,0 +1,21 @@
+{
+  "name": "lark-cursor-bridge",
+  "version": "1.0.0",
+  "description": "飞书智能体与Cursor测试流程的桥接服务",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:cli": "node src/index-cli.js",
+    "dev": "node --watch src/index.js",
+    "tunnel": "npx localtunnel --port 3000"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.0",
+    "@larksuiteoapi/node-sdk": "^1.67.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "localtunnel": "^2.0.2"
+  }
+}
