@@ -1,0 +1,17 @@
+{
+  "prototype": {},
+  "ui": {
+    "name": "AI CAL  UI 项目",
+    "lastModified": "2026-07-06T07:40:51Z",
+    "version": "2373009327545896668"
+  },
+  "analysis": [
+    {
+      "source": "ui",
+      "nodeCount": 59,
+      "frames": 1,
+      "texts": 17
+    }
+  ],
+  "uiImageUrl": "https://figma-alpha-api.s3.us-west-2.amazonaws.com/images/f73b6301-17fe-469e-a738-0068c3ff7623"
+}

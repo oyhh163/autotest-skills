@@ -1,0 +1,17 @@
+{
+  "name": "test-system-common",
+  "version": "1.0.0",
+  "description": "测试体系公共依赖和工具",
+  "private": true,
+  "dependencies": {
+    "xlsx": "^0.18.5",
+    "yazl": "^2.5.1",
+    "@playwright/test": "^1.40.0"
+  },
+  "scripts": {
+    "install-browsers": "npx playwright install chromium msedge ffmpeg",
+    "generate-excel": "node generators/excel-generator.js",
+    "generate-xmind": "node generators/xmind-generator.js",
+    "generate-report": "node generators/report-generator.js"
+  }
+}
