@@ -34,6 +34,8 @@ function createSession(chatId, requirementUrl) {
     chatId,
     requirementUrl,
     status: 'pending',
+    // 目标阶段：full=完整流程；analyze/testcase/autocase=单模块，跑到该阶段即结束
+    targetPhase: 'full',
     // 进度跟踪
     progress: {
       currentPhase: 'init',
@@ -303,11 +305,27 @@ async function processAgentConversation(session, initialPrompt, callbacks) {
       session.status = 'running';
       session.pendingChoice = null;
       
-      // 继续后续阶段（根据自动化模式决定是否真正执行）
-      const execHint = session.automation?.mode === 'prepare'
-        ? '仅生成自动化脚本【不要执行】([阶段:autocase])'
-        : '筛选自动化用例([阶段:autocase])、执行自动化([阶段:execute])';
-      currentPrompt = `用户已完成测试用例核验（可能已修改本地 Excel/XMind 文件）。请重新读取最新的测试用例文件，然后继续执行剩余流程：${execHint}、汇总Bug([阶段:feedback])，完成后输出 [完成]。`;
+      // 目标阶段为 testcase：核验后即结束，不再继续自动化
+      const target = session.targetPhase || 'full';
+      if (target === 'testcase') {
+        updatePhaseProgress(session, 'testcase', 'done', '核验完成');
+        session.status = 'completed';
+        session.results = { outputDir: session.outputDir, response: fullResponse };
+        await onProgress(session.progress);
+        await onComplete?.(session.results);
+        break;
+      }
+
+      // 继续后续阶段（根据目标阶段与自动化模式决定做到哪一步）
+      let execHint;
+      if (target === 'autocase') {
+        execHint = '筛选并生成自动化脚本【不要执行】([阶段:autocase])';
+      } else if (session.automation?.mode === 'prepare') {
+        execHint = '仅生成自动化脚本【不要执行】([阶段:autocase])';
+      } else {
+        execHint = '筛选自动化用例([阶段:autocase])、执行自动化([阶段:execute])、汇总Bug([阶段:feedback])';
+      }
+      currentPrompt = `用户已完成测试用例核验（可能已修改本地 Excel/XMind 文件）。请重新读取最新的测试用例文件，然后继续执行：${execHint}，完成后输出 [完成]。`;
       continue;
     }
     
@@ -332,7 +350,11 @@ async function processAgentConversation(session, initialPrompt, callbacks) {
     
     // 检测是否完成
     if (detectCompletion(fullResponse)) {
-      updatePhaseProgress(session, 'feedback', 'done', '已完成');
+      // 单模块模式：以目标阶段作为完成标记；进度条视为完成
+      const donePhase = (session.targetPhase && session.targetPhase !== 'full') ? session.targetPhase : 'feedback';
+      PHASE_KEYS.forEach((k) => { session.progress.phaseStatus[k] = 'done'; });
+      session.progress.currentPhase = donePhase;
+      session.progress.phaseDetails[donePhase] = '已完成';
       session.status = 'completed';
       session.results = {
         outputDir: session.outputDir,
@@ -352,7 +374,8 @@ async function processAgentConversation(session, initialPrompt, callbacks) {
  * 构建测试提示词（包含预检答案）
  */
 function buildTestPrompt(session, outputDir) {
-  const platform = session.platform || 'Web';
+  // 平台仅服务于自动化阶段；分析/用例阶段不设默认端，交由 Cursor 从需求推断
+  const platform = session.platform || null;
   const figmaInfo = session.hasFigma 
     ? `有 Figma 设计图，链接: ${session.figmaUrl || '(用户将提供)'}`
     : '无 Figma 设计图';
@@ -361,48 +384,119 @@ function buildTestPrompt(session, outputDir) {
   const reqType = session.requirementType || 'url';
   let requirementSection;
   if (reqType === 'image') {
-    requirementSection = `需求来源: 需求截图\n截图路径: ${session.requirementImagePath}\n请先读取并分析该截图图片，从中提取需求内容，再进行测试设计。`;
+    const extra = session.requirementExtraText
+      ? `\n用户补充说明: ${session.requirementExtraText}`
+      : '';
+    requirementSection = `需求来源: 需求截图\n截图路径: ${session.requirementImagePath}${extra}\n请先用读取图片的方式打开并识别该截图（本地文件路径，可直接读取），从图中提取完整需求内容，再进行测试设计。`;
   } else if (reqType === 'text') {
     requirementSection = `需求来源: 用户直接输入的需求内容\n需求内容:\n${session.requirementUrl}`;
   } else {
     requirementSection = `需求链接: ${session.requirementUrl}`;
   }
   
-  // 核验说明：需要核验时，先执行到生成测试用例导出后停下
-  const reviewSection = session.needReview
-    ? `\n【用户已选择：需要人工核验测试用例】\n请先只执行到"生成测试用例"阶段：完成需求分析、生成测试用例、导出 Excel 和 XMind 后，输出一行 [待核验] 并【立即停止】，不要继续筛选自动化和执行自动化。等待用户核验确认后会再收到继续指令。`
-    : `\n【用户已选择：无需人工核验】请连续执行完整流程直到结束。`;
+  // 执行范围：单模块模式下跑到目标阶段即收尾（默认 full 走完整流程）
+  const target = (session.targetPhase && session.targetPhase !== 'full') ? session.targetPhase : 'feedback';
+  const isSingleModule = target !== 'feedback';
+  const reviewSection = buildScopeSection(target, session);
 
-  // 自动化配置：由飞书预检问答收集，Cursor 无需再询问阶段6相关信息
-  const automationSection = buildAutomationSection(session, platform);
+  // 平台说明：有明确平台（自动化阶段）才注入；否则让 Cursor 自行判断端
+  const platformLine = platform
+    ? `目标平台: ${platform}（已确定，无需再次询问）`
+    : '目标端: 未指定。请根据需求内容判断适用端(Web/iOS/Android)用于用例设计；无法判断则按通用方式处理。本阶段不涉及自动化，不要就平台向用户提问。';
 
-  return `请执行测试体系流程，对以下需求进行测试：
+  // 自动化配置：仅在已收集自动化配置（自动化相关阶段）时才注入
+  const automationSection = session.automation
+    ? buildAutomationSection(session, platform)
+    : '';
+
+  // 开头语：单模块模式明确"只执行到某阶段"
+  const openingMap = {
+    analyze: '请【只执行需求分析】这一个阶段，不要进行任何后续阶段。需求如下：',
+    testcase: '请对以下需求执行到【生成并导出测试用例】为止（含需求分析），完成后停止，不要进行自动化：',
+    autocase: '请对以下需求执行到【生成自动化脚本（不执行）】为止，完成后停止：',
+    feedback: '请执行完整测试体系流程，对以下需求进行测试：',
+  };
+  const opening = openingMap[target] || openingMap.feedback;
+
+  // 阶段格式示例：只列出到目标阶段
+  const order = ['analyze', 'testcase', 'autocase', 'execute', 'feedback'];
+  const phaseExamples = {
+    analyze: '[阶段:analyze] 正在分析需求文档',
+    testcase: '[阶段:testcase] 生成测试用例 3/10',
+    autocase: '[阶段:autocase] 筛选自动化用例 5/20',
+    execute: '[阶段:execute] 执行自动化 通过 8/10',
+    feedback: '[阶段:feedback] 汇总Bug',
+  };
+  const targetIdx = order.indexOf(target);
+  const exampleLines = order.slice(0, targetIdx + 1).map((k) => phaseExamples[k]).join('\n');
+
+  // 单模块强约束
+  const strictLimit = isSingleModule
+    ? `\n\n【严格约束】本次只能执行到 [阶段:${target}] 为止。完成该阶段后立即输出一行 [完成] 并停止，禁止执行其之后的任何阶段（不要生成/执行你未被要求的内容）。`
+    : '';
+
+  // 核验提示仅在需要核验且目标≥用例时有意义
+  const reviewFormatHint = (session.needReview && targetIdx >= 1)
+    ? '\n\n需要人工核验时，生成并导出测试用例后输出：\n[待核验] 测试用例已生成，等待核验'
+    : '';
+
+  const confirmedInfo = [
+    `输出目录: ${outputDir}`,
+    platformLine,
+    `Figma: ${figmaInfo}（已确定，无需再次询问）`,
+  ]
+    .concat(automationSection ? [automationSection] : [])
+    .join('\n');
+
+  return `${opening}
 
 ${requirementSection}
-输出目录: ${outputDir}
-目标平台: ${platform}（已确定，无需再次询问）
-Figma: ${figmaInfo}（已确定，无需再次询问）
-${automationSection}
+${confirmedInfo}
 
-【重要】以上平台、Figma、是否核验、自动化配置均已由用户确认，请勿再询问这些问题。
-${reviewSection}
+【重要】Figma、是否核验、自动化配置等均已由用户确认，请勿再向用户询问；若未指定平台，请自行从需求判断，也不要就平台提问。
+${reviewSection}${strictLimit}
 
 执行时请严格遵循以下格式输出，以便进度同步（每个标记单独占一行）：
 
 进入新阶段时输出：
-[阶段:analyze] 正在分析需求文档
-[阶段:testcase] 生成测试用例 3/10
-[阶段:autocase] 筛选自动化用例 5/20
-[阶段:execute] 执行自动化 通过 8/10
-[阶段:feedback] 汇总Bug
-
-需要人工核验时，生成并导出测试用例后输出：
-[待核验] 测试用例已生成，等待核验
+${exampleLines}${reviewFormatHint}
 
 完成时输出：
 [完成] 测试流程结束
 
 请开始执行。`;
+}
+
+/**
+ * 构建"执行范围"说明：控制流程跑到哪个阶段结束
+ * - analyze  : 只做需求分析
+ * - testcase : 到生成并导出测试用例
+ * - autocase : 到生成自动化脚本（不执行）
+ * - feedback : 完整流程（默认）
+ */
+function buildScopeSection(target, session) {
+  if (target === 'analyze') {
+    return '\n【执行范围：仅需求分析】只完成需求分析阶段：解析需求并生成 requirements-analysis.md。完成后立即输出一行 [完成]，不要生成测试用例、不要做自动化、不要执行。';
+  }
+
+  if (target === 'testcase') {
+    if (session.needReview) {
+      return '\n【执行范围：到生成测试用例】完成需求分析→生成测试用例→导出 Excel 和 XMind。导出后输出一行 [待核验] 并【停止】，等待用户核验（不要进行自动化）。';
+    }
+    return '\n【执行范围：到生成测试用例】完成需求分析→生成测试用例→导出 Excel 和 XMind 后，立即输出一行 [完成]，不要进行自动化筛选与执行。';
+  }
+
+  if (target === 'autocase') {
+    if (session.needReview) {
+      return '\n【执行范围：到生成自动化脚本】先完成需求分析→生成测试用例→导出后输出 [待核验] 并停止等待核验；核验通过后再筛选并生成自动化脚本（不要执行），最后输出 [完成]。';
+    }
+    return '\n【执行范围：到生成自动化脚本】完成需求分析→生成测试用例→导出→筛选并生成自动化脚本（不要执行）。完成后输出一行 [完成]。';
+  }
+
+  // feedback / full：保持原完整流程行为
+  return session.needReview
+    ? '\n【用户已选择：需要人工核验测试用例】\n请先只执行到"生成测试用例"阶段：完成需求分析、生成测试用例、导出 Excel 和 XMind 后，输出一行 [待核验] 并【立即停止】，不要继续筛选自动化和执行自动化。等待用户核验确认后会再收到继续指令。'
+    : '\n【用户已选择：无需人工核验】请连续执行完整流程直到结束。';
 }
 
 /**

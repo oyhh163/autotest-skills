@@ -17,6 +17,10 @@ let client = null;
 // 存储每个会话的进度卡片消息ID，用于更新而非重复发送
 const progressCardIds = new Map();
 
+// 存储每个会话最近一张“选择卡片”的上下文，用于点击后回填选中态
+// chatId -> { messageId, title, content, options, callbackKey }
+const choiceCards = new Map();
+
 function initLarkClient() {
   if (!client) {
     client = new lark.Client({
@@ -116,69 +120,74 @@ async function sendTextMessage(chatId, text) {
  * @param {Array} options - 选项数组 [{value, text}]
  * @param {string} callbackKey - 回调标识
  */
-async function sendInteractiveCard(chatId, title, content, options, callbackKey) {
-  const cli = initLarkClient();
-  
+/**
+ * 构建“选择卡片”对象
+ * @param {string|null} selectedValue 已选中的选项 value；为 null 表示初始未选择状态
+ *
+ * 初始状态：所有按钮统一样式（不预置默认高亮）；
+ * 已选择状态：仅被点击的选项高亮(primary)并加勾，其余置灰(default)且移除回调值，
+ *            底部提示替换为“✅ 已选择：xxx”。
+ */
+function buildChoiceCard(title, content, options, callbackKey, chatId, selectedValue = null) {
+  const hasSelection = selectedValue != null;
+
   const elements = [
     {
       tag: 'div',
-      text: {
-        tag: 'lark_md',
-        content: content || '请选择：',
-      },
+      text: { tag: 'lark_md', content: content || '请选择：' },
     },
     { tag: 'hr' },
   ];
-  
-  // 每个选项单独一行按钮（垂直排列，避免横向拥挤/截断）
-  const buttonColors = ['primary', 'default', 'default', 'default', 'default'];
-  options.forEach((opt, index) => {
+
+  (options || []).forEach((opt) => {
+    const isSelected = hasSelection && opt.value === selectedValue;
+    const btn = {
+      tag: 'button',
+      text: {
+        tag: 'plain_text',
+        content: isSelected ? `✔ ${opt.text}` : opt.text,
+      },
+      type: isSelected ? 'primary' : 'default',
+    };
+    // 未选择状态：挂载回调值可点击；已选择后不再挂载，避免重复触发
+    if (!hasSelection) {
+      btn.value = {
+        key: callbackKey || 'user_choice',
+        selected: opt.value,
+        chat_id: chatId,
+      };
+    }
+    elements.push({ tag: 'action', actions: [btn] });
+  });
+
+  if (hasSelection) {
+    const selText = ((options || []).find((o) => o.value === selectedValue) || {}).text || selectedValue;
     elements.push({
-      tag: 'action',
-      actions: [
-        {
-          tag: 'button',
-          text: {
-            tag: 'plain_text',
-            content: opt.text,
-          },
-          type: buttonColors[index] || 'default',
-          value: {
-            key: callbackKey || 'user_choice',
-            selected: opt.value,
-            chat_id: chatId,
-          },
-        },
-      ],
+      tag: 'note',
+      elements: [{ tag: 'plain_text', content: `✅ 已选择：${selText}` }],
     });
-  });
-  
-  // 备用提示：也支持回复编号
-  elements.push({
-    tag: 'note',
-    elements: [
-      {
-        tag: 'plain_text',
-        content: '💡 点击按钮选择，或直接回复选项编号（如 1）',
-      },
-    ],
-  });
-  
-  const card = {
-    config: {
-      wide_screen_mode: true,
-      update_multi: true,
-    },
+  } else {
+    elements.push({
+      tag: 'note',
+      elements: [{ tag: 'plain_text', content: '💡 点击按钮选择，或直接回复选项编号（如 1）' }],
+    });
+  }
+
+  return {
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
-      title: {
-        tag: 'plain_text',
-        content: title || '需要您的选择',
-      },
-      template: 'orange',
+      title: { tag: 'plain_text', content: title || '需要您的选择' },
+      template: hasSelection ? 'green' : 'orange',
     },
     elements,
   };
-  
+}
+
+async function sendInteractiveCard(chatId, title, content, options, callbackKey) {
+  const cli = initLarkClient();
+
+  const card = buildChoiceCard(title, content, options, callbackKey, chatId, null);
+
   try {
     const result = await cli.im.message.create({
       data: {
@@ -190,12 +199,34 @@ async function sendInteractiveCard(chatId, title, content, options, callbackKey)
         receive_id_type: 'chat_id',
       },
     });
+    const messageId = result?.data?.message_id;
+    if (messageId) {
+      choiceCards.set(chatId, { messageId, title, content, options, callbackKey });
+    }
     return result;
   } catch (error) {
     console.error('发送交互卡片失败:', error?.message || error);
     // 降级为文本消息
     const optionsList = options.map((opt, i) => `${i + 1}. ${opt.text}`).join('\n');
     await sendTextMessage(chatId, `【${title}】\n${content}\n\n${optionsList}\n\n请回复选项编号进行选择。`);
+  }
+}
+
+/**
+ * 用户完成选择后，将对应的选择卡片更新为“已选中”状态（保留在所点选项上）
+ * @returns {Promise<boolean>} 是否成功更新
+ */
+async function markChoiceCardSelected(chatId, selectedValue) {
+  const ctx = choiceCards.get(chatId);
+  if (!ctx || !ctx.messageId) return false;
+  try {
+    const card = buildChoiceCard(ctx.title, ctx.content, ctx.options, ctx.callbackKey, chatId, selectedValue);
+    await updateCard(ctx.messageId, card);
+    choiceCards.delete(chatId);
+    return true;
+  } catch (error) {
+    console.error('更新选择卡片失败:', error?.message || error);
+    return false;
   }
 }
 
@@ -491,6 +522,214 @@ async function createBugRecords(bugs) {
 }
 
 /**
+ * 上传本地文件并作为文件消息发送到会话（用于 xmind 等附件）
+ * @param {string} chatId
+ * @param {string} filePath 本地文件绝对路径
+ * @param {string} [displayName] 展示文件名（默认取文件名）
+ * @returns {Promise<boolean>} 是否成功
+ */
+async function sendFileMessage(chatId, filePath, displayName) {
+  const cli = initLarkClient();
+
+  if (!filePath || !fs.existsSync(filePath)) {
+    console.warn('待发送文件不存在:', filePath);
+    return false;
+  }
+
+  const fileName = displayName || path.basename(filePath);
+
+  try {
+    // 1. 上传文件，获取 file_key
+    const uploadResp = await cli.im.file.create({
+      data: {
+        file_type: 'stream',
+        file_name: fileName,
+        file: fs.createReadStream(filePath),
+      },
+    });
+
+    const fileKey = uploadResp?.data?.file_key || uploadResp?.file_key;
+    if (!fileKey) {
+      console.error('文件上传未返回 file_key');
+      return false;
+    }
+
+    // 2. 作为文件消息发送
+    await cli.im.message.create({
+      data: {
+        receive_id: chatId,
+        msg_type: 'file',
+        content: JSON.stringify({ file_key: fileKey }),
+      },
+      params: { receive_id_type: 'chat_id' },
+    });
+
+    return true;
+  } catch (error) {
+    console.error('发送文件消息失败:', error?.message || error);
+    return false;
+  }
+}
+
+/**
+ * 上传文件到云空间指定文件夹，返回可访问链接
+ * @param {string} filePath 本地文件绝对路径
+ * @param {string} folderToken 目标文件夹 token
+ * @returns {Promise<string|null>} 文件可访问 URL
+ */
+// 应用身份没有个人空间根目录，上传附件需要一个文件夹 token；此处按需创建并缓存
+let uploadFolderToken = null;
+
+async function ensureUploadFolder(cli) {
+  if (uploadFolderToken) return uploadFolderToken;
+  try {
+    const r = await cli.drive.file.createFolder({
+      data: { name: 'QA测试产物', folder_token: '' },
+    });
+    uploadFolderToken = r?.data?.token || r?.token || null;
+  } catch (e) {
+    console.error('创建云空间文件夹失败:', e?.message || e);
+    uploadFolderToken = null;
+  }
+  return uploadFolderToken;
+}
+
+async function uploadFileToDrive(filePath, folderToken) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  const cli = initLarkClient();
+
+  try {
+    // 优先用传入的文件夹；没有则按需创建一个应用可写的文件夹
+    let parent = folderToken || (await ensureUploadFolder(cli));
+    if (!parent) return null;
+
+    const stat = fs.statSync(filePath);
+    const resp = await cli.drive.file.uploadAll({
+      data: {
+        file_name: path.basename(filePath),
+        parent_type: 'explorer',
+        parent_node: parent,
+        size: stat.size,
+        file: fs.createReadStream(filePath),
+      },
+    });
+
+    const fileToken = resp?.data?.file_token || resp?.file_token;
+    if (!fileToken) return null;
+
+    // 设为租户内可读，保证卡片里的链接可直接打开（失败不影响返回链接）
+    try {
+      await cli.drive.permissionPublic.patch({
+        path: { token: fileToken },
+        params: { type: 'file' },
+        data: {
+          link_share_entity: 'tenant_readable',
+          external_access_entity: 'closed',
+        },
+      });
+    } catch (e) {
+      console.warn('设置文件可见性失败（可能需手动授权）:', e?.message || e);
+    }
+
+    return `https://${config.lark.tenantDomain}/file/${fileToken}`;
+  } catch (error) {
+    console.error('上传文件到云空间失败:', error?.message || error);
+    return null;
+  }
+}
+
+/**
+ * 发送测试结果汇总卡片（在线用例表链接 + 脑图下载 + Bug 汇总）
+ * @param {string} chatId
+ * @param {object} data
+ * @param {string} [data.bitableUrl] 在线多维表格链接
+ * @param {number} [data.caseCount] 用例数量
+ * @param {Array} [data.bugs] Bug 列表
+ * @param {string} [data.bugBaseUrl] Bug 多维表格链接
+ * @param {string} [data.outputDir] 本地产物目录
+ * @param {string} [data.xmindUrl] 脑图云空间下载链接（放到卡片按钮）
+ * @param {boolean} [data.xmindAsFile] 是否已改为单独文件消息发送（无云链接时的兜底）
+ */
+async function sendResultCard(chatId, data = {}) {
+  const cli = initLarkClient();
+  const { bitableUrl, caseCount, bugs = [], bugBaseUrl, outputDir, xmindUrl, xmindAsFile } = data;
+
+  const bugCount = bugs.length;
+  const bugList = bugs.length > 0
+    ? bugs.map((b, i) => `${i + 1}. **${b.title}** (${b.severity || 'P2'})`).join('\n')
+    : '✅ 未发现问题';
+
+  let content = '**测试流程已完成** 🎉\n\n';
+  if (typeof caseCount === 'number') {
+    content += `📝 测试用例：${caseCount} 条\n`;
+  }
+  content += `🐛 发现问题：${bugCount} 个\n\n**问题概览**\n${bugList}`;
+
+  const elements = [
+    { tag: 'div', text: { tag: 'lark_md', content } },
+    { tag: 'hr' },
+  ];
+
+  // 链接按钮区
+  const linkButtons = [];
+  if (bitableUrl) {
+    linkButtons.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '📊 在线查看用例表' },
+      type: 'primary',
+      url: bitableUrl,
+    });
+  }
+  if (xmindUrl) {
+    linkButtons.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '🧠 下载脑图(.xmind)' },
+      type: 'default',
+      url: xmindUrl,
+    });
+  }
+  if (bugBaseUrl) {
+    linkButtons.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '🐛 查看Bug表格' },
+      type: 'default',
+      url: bugBaseUrl,
+    });
+  }
+  if (linkButtons.length > 0) {
+    elements.push({ tag: 'action', actions: linkButtons });
+  }
+
+  const notes = [];
+  if (xmindAsFile) notes.push('🧠 脑图(.xmind)已作为文件单独发送，可下载后用 XMind 打开');
+  if (outputDir) notes.push(`📁 本地产物目录：${outputDir}`);
+  if (notes.length > 0) {
+    elements.push({
+      tag: 'note',
+      elements: notes.map((n) => ({ tag: 'plain_text', content: n })),
+    });
+  }
+
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: bugCount > 0 ? `🐛 完成，发现 ${bugCount} 个问题` : '✅ 测试完成' },
+      template: bugCount > 0 ? 'orange' : 'green',
+    },
+    elements,
+  };
+
+  return await cli.im.message.create({
+    data: {
+      receive_id: chatId,
+      msg_type: 'interactive',
+      content: JSON.stringify(card),
+    },
+    params: { receive_id_type: 'chat_id' },
+  });
+}
+
+/**
  * 发送Bug汇总卡片
  */
 async function sendBugSummaryCard(chatId, bugs, baseUrl) {
@@ -556,12 +795,16 @@ module.exports = {
   downloadMessageImage,
   sendTextMessage,
   sendInteractiveCard,
+  markChoiceCardSelected,
   sendProgressCard,
   sendOrUpdateProgressCard,
   updateCard,
   createBugRecord,
   createBugRecords,
   sendBugSummaryCard,
+  sendFileMessage,
+  uploadFileToDrive,
+  sendResultCard,
   // 进度卡片管理
   getProgressCardId,
   setProgressCardId,

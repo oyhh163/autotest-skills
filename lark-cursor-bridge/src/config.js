@@ -19,6 +19,8 @@ const config = {
     appSecret: process.env.LARK_APP_SECRET,
     verificationToken: process.env.LARK_VERIFICATION_TOKEN,
     encryptKey: process.env.LARK_ENCRYPT_KEY || '',
+    // 租户域名，用于拼接云文档/文件的可访问链接
+    tenantDomain: process.env.LARK_TENANT_DOMAIN || 'novabeyond.feishu.cn',
   },
   
   // Cursor SDK 配置
@@ -31,6 +33,12 @@ const config = {
   bugTable: {
     baseToken: process.env.LARK_BASE_TOKEN,
     tableId: process.env.LARK_TABLE_ID,
+  },
+  
+  // 动态创建在线用例表的配置
+  bitable: {
+    // 可选：指定创建到的云空间文件夹 token（不填则创建到应用默认位置）
+    folderToken: process.env.LARK_BITABLE_FOLDER_TOKEN || '',
   },
   
   // 服务配置

@@ -5,13 +5,46 @@
  * 支持消息监听和卡片回调
  */
 
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const readline = require('readline');
 const larkClient = require('./lark-client');
 const cursorRunner = require('./cursor-runner');
+const bitablePublisher = require('./bitable-publisher');
 
 let messageListenerProcess = null;
 let cardListenerProcess = null;
+
+// 事件总线中存在“残留消费者注册”时（多因上次未正常退出），最多自动重置一次总线
+let busResetDone = false;
+let msgStaleConsumer = false;
+let cardStaleConsumer = false;
+
+/**
+ * 某事件报错文本是否表示“总线中已有该订阅的残留消费者”
+ */
+function isStaleConsumerError(text) {
+  return (
+    text.includes('already running for this subscription') ||
+    text.includes('another consumer')
+  );
+}
+
+/**
+ * 重置 lark-cli 事件总线（清除残留消费者注册），最多执行一次
+ */
+function resetEventBusOnce() {
+  if (busResetDone) return false;
+  busResetDone = true;
+  console.warn('⚠️ 检测到事件总线存在残留消费者注册，正在重置总线...');
+  try {
+    execSync('lark-cli event stop', { shell: true, stdio: 'ignore' });
+    console.log('✅ 事件总线已重置，将重新注册监听器');
+    return true;
+  } catch (e) {
+    console.error('重置事件总线失败:', e.message);
+    return false;
+  }
+}
 
 /**
  * 启动消息监听器
@@ -48,6 +81,8 @@ function startMessageListener(onMessage) {
     const text = data.toString();
     if (text.includes('ready')) {
       console.log('✅ 消息监听器已就绪');
+    } else if (isStaleConsumerError(text)) {
+      msgStaleConsumer = true;
     } else if (text.includes('error') || text.includes('Error')) {
       console.error('消息监听器错误:', text);
     }
@@ -56,8 +91,14 @@ function startMessageListener(onMessage) {
   messageListenerProcess.on('close', (code) => {
     console.log(`消息监听器退出，代码: ${code}`);
     if (code !== 0) {
-      console.log('5秒后重新启动消息监听...');
-      setTimeout(() => startMessageListener(onMessage), 5000);
+      if (msgStaleConsumer && !busResetDone) {
+        msgStaleConsumer = false;
+        resetEventBusOnce();
+        setTimeout(() => startMessageListener(onMessage), 1500);
+      } else {
+        console.log('5秒后重新启动消息监听...');
+        setTimeout(() => startMessageListener(onMessage), 5000);
+      }
     }
   });
   
@@ -107,8 +148,11 @@ function startCardListener() {
     const text = data.toString();
     if (text.includes('ready')) {
       console.log('✅ 卡片回调监听器已就绪');
-    } else if (text.includes('not subscribed') || text.includes('failed_precondition')) {
-      // 事件未订阅，禁用卡片监听避免无限重启
+    } else if (isStaleConsumerError(text)) {
+      // 总线残留消费者注册：可自愈（重置总线后重试），不要禁用
+      cardStaleConsumer = true;
+    } else if (text.includes('not subscribed')) {
+      // 事件确实未订阅，禁用卡片监听避免无限重启
       cardListenerDisabled = true;
       console.warn('⚠️ card.action.trigger 未在开放平台订阅，已禁用卡片点击回调');
       console.warn('   → 用户可通过回复选项编号完成选择');
@@ -119,10 +163,15 @@ function startCardListener() {
   
   cardListenerProcess.on('close', (code) => {
     console.log(`卡片监听器退出，代码: ${code}`);
-    // 仅在非订阅错误且未禁用时重启
     if (code !== 0 && !cardListenerDisabled) {
-      console.log('5秒后重新启动卡片监听...');
-      setTimeout(() => startCardListener(), 5000);
+      if (cardStaleConsumer && !busResetDone) {
+        cardStaleConsumer = false;
+        resetEventBusOnce();
+        setTimeout(() => startCardListener(), 1500);
+      } else {
+        console.log('5秒后重新启动卡片监听...');
+        setTimeout(() => startCardListener(), 5000);
+      }
     }
   });
   
@@ -196,7 +245,11 @@ async function handleCardAction(event) {
     
     if (resolved) {
       console.log(`✅ 用户选择已传递: ${selectedValue}`);
-      await larkClient.sendTextMessage(chatId, `✅ 已收到选择：${selectedValue}`);
+      // 将卡片更新为“已选中”状态，停留在用户点击的选项上
+      const updated = await larkClient.markChoiceCardSelected(chatId, selectedValue);
+      if (!updated) {
+        await larkClient.sendTextMessage(chatId, `✅ 已收到选择：${selectedValue}`);
+      }
     } else {
       console.log(`⚠️ 未找到等待选择的会话: ${chatId}`);
     }
@@ -224,28 +277,52 @@ async function handleMessage(event, onMessage) {
       content = { text: message.content };
     }
     
+    // 调试：非文本消息打印原始结构，便于排查（截图/富文本等）
+    if (messageType !== 'text') {
+      console.log(`[调试] 消息类型=${messageType} 原始内容=${JSON.stringify(content).slice(0, 800)}`);
+    }
+    
     // 图片消息：下载并作为需求截图分析
     if (messageType === 'image') {
-      const imageKey = content.image_key;
+      // 兼容多种字段：直接的 image_key，或 lark-cli 归一化后的 text（[Image: key] / ![](key)）
+      let imageKey = content.image_key || content.file_key;
+      if (!imageKey && typeof content.text === 'string') {
+        imageKey = extractInlineImages(content.text).imageKeys[0] || null;
+      }
       console.log(`收到图片消息: image_key=${imageKey} (chat: ${chatId})`);
       if (imageKey && messageId) {
         await handleRequirementImage(chatId, messageId, imageKey);
+      } else {
+        await larkClient.sendTextMessage(chatId, '❌ 未能识别图片，请重试或改用文字/链接。');
       }
       return;
     }
     
-    // 富文本消息：尽量提取纯文本
+    // 富文本消息：提取纯文本 + 内嵌图片
     let text = '';
+    let embeddedImageKeys = [];
     if (messageType === 'text') {
       text = (content.text || '').trim();
     } else if (messageType === 'post') {
-      text = extractPostText(content).trim();
+      const parsed = parsePostRich(content);
+      text = parsed.text;
+      embeddedImageKeys = parsed.imageKeys;
     } else {
       // 其他类型暂不处理
       return;
     }
     
-    console.log(`收到消息: ${text} (chat: ${chatId})`);
+    console.log(`收到消息: ${text} (type=${messageType}, 内嵌图片=${embeddedImageKeys.length}) (chat: ${chatId})`);
+    
+    // 富文本内嵌截图：作为需求截图处理（附带的文字用于识别模式/补充说明）
+    if (embeddedImageKeys.length > 0 && messageId) {
+      const { targetPhase } = detectMode(text || '');
+      await handleRequirementImage(chatId, messageId, embeddedImageKeys[0], {
+        targetPhase,
+        extraText: text,
+      });
+      return;
+    }
     
     // 调用回调
     if (onMessage) {
@@ -300,7 +377,10 @@ async function handleMessage(event, onMessage) {
       if (chosen) {
         const resolved = cursorRunner.resolveUserChoice(chatId, chosen);
         if (resolved) {
-          await larkClient.sendTextMessage(chatId, `✅ 已收到选择：${chosen}`);
+          const updated = await larkClient.markChoiceCardSelected(chatId, chosen);
+          if (!updated) {
+            await larkClient.sendTextMessage(chatId, `✅ 已收到选择：${chosen}`);
+          }
           return;
         }
       } else {
@@ -319,23 +399,39 @@ async function handleMessage(event, onMessage) {
     if (isHelpCommand(text)) {
       await larkClient.sendTextMessage(
         chatId,
-        '👋 你好！我是测试助手。\n\n你可以通过以下任意方式开始测试：\n\n1️⃣ 发送需求文档链接（飞书文档/Confluence/Notion等）\n2️⃣ 直接粘贴需求内容文字\n3️⃣ 发送需求截图（我会分析图片内容）\n\n随时发送"停止"可中止流程。'
+        '👋 你好！我是测试助手。\n\n**开始完整测试**，发送需求（任选其一）：\n1️⃣ 需求文档链接（飞书文档/Confluence/Notion等）\n2️⃣ 直接粘贴需求内容文字\n3️⃣ 需求截图（我会分析图片内容）\n\n**只做单个模块**：在需求前加关键词\n• 「分析需求 + 需求内容」→ 只做需求分析\n• 「生成用例 + 需求内容」→ 只生成测试用例\n• 「生成自动化 + 需求内容」→ 生成自动化脚本（不执行）\n\n随时发送"停止"可中止流程。'
       );
       return;
     }
     
+    // 识别单模块关键词（分析需求/生成用例/生成自动化），默认 full 完整流程
+    const mode = detectMode(text);
+
     // 检查是否包含需求链接
     const urlPattern = /(https?:\/\/[^\s]+)/g;
     const urls = text.match(urlPattern);
     
     if (urls && urls.length > 0 && isRequirementUrl(urls[0])) {
-      await handleRequirement(chatId, { type: 'url', content: urls[0] });
+      await handleRequirement(chatId, { type: 'url', content: urls[0], targetPhase: mode.targetPhase });
       return;
     }
     
-    // 否则：只要是有实质内容的文本，就当作需求内容启动流程
+    // 命中单模块关键词
+    if (mode.targetPhase !== 'full') {
+      if (!mode.requirement) {
+        await larkClient.sendTextMessage(
+          chatId,
+          `📌 已选择「${targetPhaseLabel(mode.targetPhase)}」。\n请把需求内容一起发给我，例如：\n「${text.trim()} + 需求文档内容」`
+        );
+        return;
+      }
+      await handleRequirement(chatId, { type: 'text', content: mode.requirement, targetPhase: mode.targetPhase });
+      return;
+    }
+    
+    // 否则：只要是有实质内容的文本，就当作需求内容启动完整流程
     if (isLikelyRequirement(text)) {
-      await handleRequirement(chatId, { type: 'text', content: text });
+      await handleRequirement(chatId, { type: 'text', content: text, targetPhase: 'full' });
       return;
     }
     
@@ -351,29 +447,76 @@ async function handleMessage(event, onMessage) {
 }
 
 /**
- * 提取富文本(post)消息中的纯文本
+ * 从一段文本中提取内嵌图片 key 并剥离图片标记
+ * 兼容 lark-cli 归一化后的形式：
+ * - markdown 图片：![alt](image_key)
+ * - 方括号形式：[Image: image_key]
+ * @returns {{text:string, imageKeys:string[]}}
+ */
+function extractInlineImages(str) {
+  const imageKeys = [];
+  let text = String(str || '');
+  text = text.replace(/!\[[^\]]*\]\(([^)]+)\)/g, (_, k) => {
+    if (k && k.trim()) imageKeys.push(k.trim());
+    return '';
+  });
+  text = text.replace(/\[Image:\s*([^\]]+)\]/gi, (_, k) => {
+    if (k && k.trim()) imageKeys.push(k.trim());
+    return '';
+  });
+  return { text: text.trim(), imageKeys };
+}
+
+/**
+ * 解析富文本(post)消息，提取纯文本与内嵌图片 key
+ *
+ * lark-cli 长连接通常把富文本归一化为 { text: "文字\n![Image](image_key)" }。
+ * 同时兼容结构化格式：{ title, content: [[{tag,text,href,image_key}]] } 及语言包裹。
+ * @returns {{text:string, imageKeys:string[]}}
+ */
+function parsePostRich(content) {
+  try {
+    // 归一化文本形式（lark-cli 常见）
+    if (typeof content.text === 'string') {
+      return extractInlineImages(content.text);
+    }
+
+    let node = content.post || content;
+
+    // 语言包裹格式：取第一个含 content/title 的语言块
+    if (node && !Array.isArray(node.content) && typeof node.title === 'undefined') {
+      const block = Object.values(node).find((v) => v && (Array.isArray(v.content) || v.title));
+      if (block) node = block;
+    }
+
+    let text = '';
+    const imageKeys = [];
+    if (node.title) text += node.title + '\n';
+
+    const rows = Array.isArray(node.content) ? node.content : [];
+    for (const row of rows) {
+      if (!Array.isArray(row)) continue;
+      for (const seg of row) {
+        if (!seg) continue;
+        if (seg.text) text += seg.text;
+        if (seg.tag === 'a' && seg.href) text += seg.href;
+        if (seg.tag === 'img' && (seg.image_key || seg.file_key)) {
+          imageKeys.push(seg.image_key || seg.file_key);
+        }
+      }
+      text += '\n';
+    }
+    return { text: text.trim(), imageKeys };
+  } catch {
+    return { text: '', imageKeys: [] };
+  }
+}
+
+/**
+ * 提取富文本(post)消息中的纯文本（兼容旧调用）
  */
 function extractPostText(content) {
-  try {
-    const post = content.post || content;
-    let result = '';
-    // post 结构: { zh_cn: { title, content: [[{tag,text}...]] } }
-    for (const lang of Object.keys(post)) {
-      const block = post[lang];
-      if (block.title) result += block.title + '\n';
-      const rows = block.content || [];
-      for (const row of rows) {
-        for (const seg of row) {
-          if (seg.text) result += seg.text;
-          if (seg.tag === 'a' && seg.href) result += seg.href;
-        }
-        result += '\n';
-      }
-    }
-    return result;
-  } catch {
-    return '';
-  }
+  return parsePostRich(content).text;
 }
 
 /**
@@ -383,6 +526,64 @@ function isHelpCommand(text) {
   const t = text.trim().toLowerCase();
   const cmds = ['帮助', 'help', '你好', 'hi', 'hello', '开始', '执行测试', '测试', '开始测试'];
   return cmds.includes(t);
+}
+
+/**
+ * 从消息文本识别单模块模式与目标阶段
+ * 命令词可出现在：
+ *  1) 开头（可带 请/帮我/麻烦 前缀），命令词之后为需求正文
+ *  2) 任意位置单独成行（如需求正文末尾单独写一行"分析需求"）
+ * 命中后会把命令词从需求正文中剔除。
+ * @returns {{targetPhase:string, requirement:string}}
+ */
+function detectMode(text) {
+  const raw = (text || '').trim();
+  const rules = [
+    { phase: 'analyze', kws: ['分析需求', '需求分析', '只分析需求', '只做需求分析'] },
+    { phase: 'testcase', kws: ['生成测试用例', '生成用例', '只生成用例', '写测试用例', '编写测试用例'] },
+    { phase: 'autocase', kws: ['生成自动化用例', '生成自动化脚本', '生成自动化', '自动化用例', '自动化脚本'] },
+  ];
+
+  // 1) 开头前缀匹配（命令词与正文在同一段/同一行开头）
+  for (const rule of rules) {
+    for (const kw of rule.kws) {
+      const re = new RegExp(`^(请|帮我|麻烦|帮忙)?\\s*${kw}[：:，,。\\s]*`);
+      if (re.test(raw)) {
+        const requirement = raw.replace(re, '').trim();
+        return { targetPhase: rule.phase, requirement };
+      }
+    }
+  }
+
+  // 2) 命令词单独成行（可带前缀），出现在任意行
+  const lines = raw.split('\n');
+  for (const rule of rules) {
+    for (const kw of rule.kws) {
+      const lineRe = new RegExp(`^(请|帮我|麻烦|帮忙)?\\s*${kw}[：:，,。\\s]*$`);
+      const idx = lines.findIndex((l) => lineRe.test(l.trim()));
+      if (idx >= 0) {
+        const requirement = lines
+          .filter((_, i) => i !== idx)
+          .join('\n')
+          .trim();
+        return { targetPhase: rule.phase, requirement };
+      }
+    }
+  }
+
+  return { targetPhase: 'full', requirement: raw };
+}
+
+/**
+ * 目标阶段的中文名（用于提示）
+ */
+function targetPhaseLabel(target) {
+  return {
+    analyze: '仅需求分析',
+    testcase: '生成测试用例',
+    autocase: '生成自动化脚本',
+    full: '完整测试流程',
+  }[target] || '完整测试流程';
 }
 
 /**
@@ -471,22 +672,14 @@ async function askText(session, { type, title, question, allowSkip = true }) {
  */
 async function runPreflight(session) {
   const chatId = session.chatId;
+  const target = session.targetPhase || 'full';
   
-  // Q1: 目标平台（固定3个选项）
-  const platform = await askChoice(session, {
-    type: 'platform',
-    title: '📱 选择目标平台',
-    question: '请选择本次测试的目标平台',
-    options: [
-      { value: 'Web', text: 'Web 网页端' },
-      { value: 'iOS', text: 'iOS 移动端' },
-      { value: 'Android', text: 'Android 移动端' },
-    ],
-  });
-  session.platform = platform;
-  await larkClient.sendTextMessage(chatId, `✅ 目标平台：${platform}`);
+  // 仅需求分析：无需任何预检，直接开跑
+  if (target === 'analyze') {
+    return;
+  }
   
-  // Q2: 是否有 Figma 设计图
+  // Q1: 是否有 Figma 设计图（用于用例文案校验，分析/用例阶段也可能用到）
   const figma = await askChoice(session, {
     type: 'figma',
     title: '🎨 Figma 设计图',
@@ -510,7 +703,7 @@ async function runPreflight(session) {
     await larkClient.sendTextMessage(chatId, `✅ 已记录 Figma 链接`);
   }
   
-  // Q3: 是否需要人工核验测试用例（决定流程是否在生成用例后暂停）
+  // Q2: 是否需要人工核验测试用例（决定流程是否在生成用例后暂停）
   const review = await askChoice(session, {
     type: 'review',
     title: '📝 测试用例核验',
@@ -525,11 +718,45 @@ async function runPreflight(session) {
     chatId,
     session.needReview
       ? '✅ 将在生成测试用例后暂停，等待你核验'
-      : '✅ 将连续执行完整流程'
+      : '✅ 将按所选范围连续执行'
   );
   
-  // Q4: 自动化执行前置问答（对应 SKILL 阶段6）
+  // 到生成用例即止：不需要平台与自动化配置
+  // 端由 Cursor 从需求内容自行推断，用例阶段不设默认端
+  if (target === 'testcase') {
+    return;
+  }
+  
+  // 以下阶段涉及自动化：平台仅在此时才需要（用于按端生成/执行脚本）
+  await askPlatform(session);
+  
+  // 只生成自动化脚本（不执行）：直接标记为 prepare，无需问 URL/浏览器等
+  if (target === 'autocase') {
+    session.automation = { mode: 'prepare' };
+    return;
+  }
+  
+  // 完整流程：自动化执行前置问答（对应 SKILL 阶段6）
   await runAutomationPreflight(session);
+}
+
+/**
+ * 询问并记录目标平台（仅自动化相关阶段调用）
+ */
+async function askPlatform(session) {
+  const platform = await askChoice(session, {
+    type: 'platform',
+    title: '📱 选择目标平台',
+    question: '请选择本次自动化的目标平台',
+    options: [
+      { value: 'Web', text: 'Web 网页端' },
+      { value: 'iOS', text: 'iOS 移动端' },
+      { value: 'Android', text: 'Android 移动端' },
+    ],
+  });
+  session.platform = platform;
+  await larkClient.sendTextMessage(session.chatId, `✅ 目标平台：${platform}`);
+  return platform;
 }
 
 /**
@@ -675,6 +902,8 @@ async function handleRequirement(chatId, requirement) {
     const session = cursorRunner.createSession(chatId, requirement.content);
     session.requirementType = requirement.type;
     session.requirementImagePath = requirement.imagePath || null;
+    session.requirementExtraText = requirement.extraText || null;
+    session.targetPhase = requirement.targetPhase || 'full';
     
     // 确认消息
     const typeLabel = {
@@ -687,9 +916,16 @@ async function handleRequirement(chatId, requirement) {
       ? `\n${requirement.content.slice(0, 100)}${requirement.content.length > 100 ? '...' : ''}`
       : (requirement.type === 'url' ? `\n${requirement.content}` : '');
     
+    const modeNote = session.targetPhase !== 'full'
+      ? `\n🎯 模式：${targetPhaseLabel(session.targetPhase)}`
+      : '';
+    const nextNote = session.targetPhase === 'analyze'
+      ? '\n\n开始分析需求 👇'
+      : '\n\n请先确认几个信息，然后开始 👇';
+    
     await larkClient.sendTextMessage(
       chatId,
-      `📋 收到${typeLabel}${preview}\n\n请先确认几个信息，然后开始测试 👇`
+      `📋 收到${typeLabel}${preview}${modeNote}${nextNote}`
     );
     
     // 异步执行：先预检问答，再启动测试流程
@@ -715,27 +951,134 @@ async function handleRequirement(chatId, requirement) {
 
 /**
  * 处理需求截图：下载图片并作为需求启动流程
+ * @param {object} [options] { targetPhase, extraText }
  */
-async function handleRequirementImage(chatId, messageId, imageKey) {
+async function handleRequirementImage(chatId, messageId, imageKey, options = {}) {
   try {
     await larkClient.sendTextMessage(chatId, '🖼️ 正在下载并分析需求截图...');
     
     const imagePath = await larkClient.downloadMessageImage(messageId, imageKey);
     if (!imagePath) {
-      await larkClient.sendTextMessage(chatId, '❌ 图片下载失败，请重试或改用文字/链接。');
+      await larkClient.sendTextMessage(
+        chatId,
+        '❌ 图片下载失败。请确认应用已开通 im:resource（读取消息资源）权限并重新发版，或改用文字/链接。'
+      );
       return;
     }
     
+    const extraText = (options.extraText || '').trim();
     await handleRequirement(chatId, {
       type: 'image',
-      content: `需求截图: ${imagePath}`,
+      content: extraText ? `需求截图: ${imagePath}\n补充说明: ${extraText}` : `需求截图: ${imagePath}`,
       imagePath,
+      targetPhase: options.targetPhase || 'full',
+      extraText,
     });
     
   } catch (error) {
     console.error('处理需求截图失败:', error);
     await larkClient.sendTextMessage(chatId, `❌ 处理截图失败: ${error.message}`);
   }
+}
+
+/**
+ * 从飞书 SDK 错误中提取可读原因（优先取接口返回的 msg）
+ */
+function larkErrorMessage(e) {
+  const data = e?.response?.data;
+  if (data?.msg) {
+    // 权限类错误给出更友好的提示
+    if (data.code === 99991672) {
+      return '应用缺少所需权限（如 bitable:app / drive:drive），请到飞书开放平台开通后重新发版。';
+    }
+    return data.msg;
+  }
+  return e?.message || String(e);
+}
+
+/**
+ * 发布测试产物：解析本地 Excel 用例 → 创建在线多维表格；上传 xmind 附件
+ * 任何一步失败都不影响主流程，返回可用的部分结果
+ * @returns {Promise<{bitableUrl:string|null, caseCount:number|null, hasXmind:boolean}>}
+ */
+async function publishTestArtifacts(chatId, session, results) {
+  const { config } = require('./config');
+  const out = { bitableUrl: null, caseCount: null, xmindUrl: null, xmindAsFile: false, analysisSent: false };
+
+  const sessionDir = results?.outputDir || session.outputDir;
+
+  // 仅需求分析模式：只发需求分析文档
+  if ((session.targetPhase || 'full') === 'analyze') {
+    try {
+      const mdPath = bitablePublisher.findOutputFile(sessionDir, config.testSystem.outputPath, 'requirements-analysis.md');
+      if (mdPath) {
+        out.analysisSent = await larkClient.sendFileMessage(chatId, mdPath, 'requirements-analysis.md');
+      }
+    } catch (e) {
+      console.error('发送需求分析文档失败:', e?.message || e);
+    }
+    return out;
+  }
+
+  try {
+    const { xlsxPath, xmindPath } = bitablePublisher.findOutputFiles(
+      sessionDir,
+      config.testSystem.outputPath
+    );
+
+    // 用于就近上传 xmind 的云空间文件夹（优先用新建 Bitable 所在文件夹）
+    let driveFolderToken = config.bitable?.folderToken || null;
+
+    // 1. 解析用例并创建在线多维表格
+    if (xlsxPath) {
+      try {
+        const { smokeCases, detailedCases } = bitablePublisher.readTestCasesFromXlsx(xlsxPath);
+        out.caseCount = smokeCases.length + detailedCases.length;
+
+        if (out.caseCount > 0) {
+          await larkClient.sendTextMessage(chatId, '📤 正在创建在线用例表...');
+          const cli = larkClient.initLarkClient();
+
+          // 用需求文本首行作为项目名（截断），否则用默认名
+          let projectName = '测试用例';
+          if (session.requirementType === 'text' && session.requirementUrl) {
+            const firstLine = String(session.requirementUrl).split('\n')[0].trim();
+            if (firstLine) projectName = firstLine.slice(0, 20);
+          }
+
+          const bitable = await bitablePublisher.createTestCaseBitable(cli, {
+            projectName,
+            smokeCases,
+            detailedCases,
+            folderToken: config.bitable?.folderToken,
+          });
+          out.bitableUrl = bitable?.url || null;
+          if (bitable?.folderToken) driveFolderToken = bitable.folderToken;
+        }
+      } catch (e) {
+        const reason = larkErrorMessage(e);
+        console.error('创建在线用例表失败:', reason);
+        await larkClient.sendTextMessage(chatId, `⚠️ 在线用例表创建失败（本地文件仍可用）：${reason}`);
+      }
+    } else {
+      console.warn('未找到 test-cases.xlsx，跳过在线用例表创建');
+    }
+
+    // 2. 上传 xmind：优先传到云空间拿链接放卡片按钮；失败则退回单独文件消息
+    if (xmindPath) {
+      const xmindUrl = await larkClient.uploadFileToDrive(xmindPath, driveFolderToken);
+      if (xmindUrl) {
+        out.xmindUrl = xmindUrl;
+      } else {
+        const ok = await larkClient.sendFileMessage(chatId, xmindPath, 'test-cases.xmind');
+        out.xmindAsFile = ok;
+      }
+    }
+  } catch (error) {
+    console.error('发布测试产物失败:', error?.message || error);
+  }
+
+  return out;
 }
 
 /**
@@ -804,26 +1147,40 @@ async function runTestFlowWithCallbacks(session) {
       onComplete: async (results) => {
         console.log('[完成] 测试流程结束');
         
+        // 仅需求分析模式：只发分析文档，不做 Bug/在线表/结果卡片
+        if ((session.targetPhase || 'full') === 'analyze') {
+          const published = await publishTestArtifacts(chatId, session, results);
+          await larkClient.sendTextMessage(
+            chatId,
+            published.analysisSent
+              ? '✅ 需求分析已完成，分析文档已发送。'
+              : `✅ 需求分析已完成。产物在本地目录：${results?.outputDir || ''}`
+          );
+          return;
+        }
+        
         // 提取并记录Bug
         const bugs = cursorRunner.extractBugsFromResults(results || {});
-        
         if (bugs.length > 0) {
           await larkClient.createBugRecords(bugs);
         }
-        
-        // 发送Bug汇总卡片
-        const baseUrl = config.bugTable.baseToken 
-          ? `https://novabeyond.feishu.cn/base/${config.bugTable.baseToken}`
+        const bugBaseUrl = config.bugTable.baseToken
+          ? `https://${config.lark.tenantDomain}/base/${config.bugTable.baseToken}`
           : null;
-        await larkClient.sendBugSummaryCard(chatId, bugs, baseUrl);
         
-        // 发送产物链接
-        if (results?.outputDir) {
-          await larkClient.sendTextMessage(
-            chatId,
-            `📁 **测试产物已生成**\n\n路径: ${results.outputDir}\n\n包含:\n• 测试用例 Excel\n• 测试脑图 XMind\n• 自动化报告（如有执行）`
-          );
-        }
+        // 发布测试产物：创建在线用例表 + 发送 xmind 附件
+        const published = await publishTestArtifacts(chatId, session, results);
+        
+        // 发送结果汇总卡片（脑图作为按钮放在卡片上）
+        await larkClient.sendResultCard(chatId, {
+          bitableUrl: published.bitableUrl,
+          caseCount: published.caseCount,
+          bugs,
+          bugBaseUrl,
+          outputDir: results?.outputDir,
+          xmindUrl: published.xmindUrl,
+          xmindAsFile: published.xmindAsFile,
+        });
       },
       
       // 错误回调
