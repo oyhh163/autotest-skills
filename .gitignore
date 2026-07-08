@@ -1,9 +1,8 @@
 # Node modules
 node_modules/
 
-# 测试产物（报告、截图等）
-test-output/*/reports/
-test-output/**/node_modules/
+# 测试产物（每次执行生成的临时目录，不纳入版本控制）
+test-output/
 *.log
 
 # 敏感信息
