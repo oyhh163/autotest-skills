@@ -14,6 +14,25 @@ const bitablePublisher = require('./bitable-publisher');
 let messageListenerProcess = null;
 let cardListenerProcess = null;
 
+// 消息去重缓存：按 event_id/message_id 记录已处理的消息，防止重复消费导致重复回复
+const processedEvents = new Map(); // key -> timestamp
+const EVENT_DEDUP_TTL = 5 * 60 * 1000; // 5分钟
+
+/**
+ * 判断事件是否已处理过（重复投递）。首次出现返回 false 并记录，重复出现返回 true。
+ */
+function isDuplicateEvent(key) {
+  if (!key) return false;
+  const now = Date.now();
+  // 清理过期记录，避免无限增长
+  for (const [k, ts] of processedEvents) {
+    if (now - ts > EVENT_DEDUP_TTL) processedEvents.delete(k);
+  }
+  if (processedEvents.has(key)) return true;
+  processedEvents.set(key, now);
+  return false;
+}
+
 // 事件总线中存在“残留消费者注册”时（多因上次未正常退出），最多自动重置一次总线
 let busResetDone = false;
 let msgStaleConsumer = false;
@@ -37,12 +56,28 @@ function resetEventBusOnce() {
   busResetDone = true;
   console.warn('⚠️ 检测到事件总线存在残留消费者注册，正在重置总线...');
   try {
-    execSync('lark-cli event stop', { shell: true, stdio: 'ignore' });
+    // 使用 --force 强制停止，因为可能存在未正常退出的消费者
+    execSync('lark-cli event stop --force', { shell: true, stdio: 'ignore' });
     console.log('✅ 事件总线已重置，将重新注册监听器');
     return true;
   } catch (e) {
     console.error('重置事件总线失败:', e.message);
     return false;
+  }
+}
+
+/**
+ * 服务启动时清理事件总线，清除上次服务遗留的孤儿消费者
+ * （父进程被杀时 lark-cli consume 子进程可能未随之退出，导致消息被重复消费）
+ */
+function cleanupOrphanConsumers() {
+  console.log('正在清理事件总线残留消费者...');
+  try {
+    execSync('lark-cli event stop --force', { shell: true, stdio: 'ignore' });
+    console.log('✅ 事件总线已清理');
+  } catch (e) {
+    // 总线未运行时会报错，属正常情况
+    console.log('事件总线无需清理（未运行或已停止）');
   }
 }
 
@@ -90,15 +125,14 @@ function startMessageListener(onMessage) {
   
   messageListenerProcess.on('close', (code) => {
     console.log(`消息监听器退出，代码: ${code}`);
-    if (code !== 0) {
-      if (msgStaleConsumer && !busResetDone) {
-        msgStaleConsumer = false;
-        resetEventBusOnce();
-        setTimeout(() => startMessageListener(onMessage), 1500);
-      } else {
-        console.log('5秒后重新启动消息监听...');
-        setTimeout(() => startMessageListener(onMessage), 5000);
-      }
+    // 无论退出代码如何，都应重启消息监听器（事件总线重置时会导致 code=0 退出）
+    if (msgStaleConsumer && !busResetDone) {
+      msgStaleConsumer = false;
+      resetEventBusOnce();
+      setTimeout(() => startMessageListener(onMessage), 1500);
+    } else {
+      console.log('5秒后重新启动消息监听...');
+      setTimeout(() => startMessageListener(onMessage), 5000);
     }
   });
   
@@ -107,11 +141,13 @@ function startMessageListener(onMessage) {
 
 // 卡片回调是否可用（未订阅时禁用，避免无限重启）
 let cardListenerDisabled = false;
+let cardStderrBuffer = '';  // 缓冲 stderr 输出以捕获多行 JSON
 
 /**
  * 启动卡片回调监听器
  */
 function startCardListener() {
+  cardStderrBuffer = '';  // 重置缓冲区
   if (cardListenerDisabled) {
     console.log('⚠️ 卡片回调事件未订阅，已禁用按钮点击回调（用户可回复编号选择）');
     return null;
@@ -136,6 +172,16 @@ function startCardListener() {
     try {
       if (!line.trim().startsWith('{')) return;
       const event = JSON.parse(line);
+      
+      // 检查是否为错误响应（JSON 格式的错误）
+      if (event.ok === false && event.error) {
+        console.error('卡片监听器错误:', event.error.message);
+        if (event.error.message && event.error.message.includes('another consumer')) {
+          cardStaleConsumer = true;
+        }
+        return;
+      }
+      
       await handleCardAction(event);
     } catch (error) {
       if (line.includes('ready')) {
@@ -146,23 +192,38 @@ function startCardListener() {
   
   cardListenerProcess.stderr.on('data', (data) => {
     const text = data.toString();
+    cardStderrBuffer += text;  // 累积 stderr 输出
+    
+    // 检测残留消费者错误
+    const hasStaleError = isStaleConsumerError(text) || isStaleConsumerError(cardStderrBuffer);
+    
     if (text.includes('ready')) {
       console.log('✅ 卡片回调监听器已就绪');
-    } else if (isStaleConsumerError(text)) {
+    }
+    
+    if (hasStaleError && !cardStaleConsumer) {
       // 总线残留消费者注册：可自愈（重置总线后重试），不要禁用
       cardStaleConsumer = true;
-    } else if (text.includes('not subscribed')) {
+      console.log('⚠️ 检测到残留消费者注册，将尝试重置总线');
+    }
+    
+    if (text.includes('not subscribed')) {
       // 事件确实未订阅，禁用卡片监听避免无限重启
       cardListenerDisabled = true;
       console.warn('⚠️ card.action.trigger 未在开放平台订阅，已禁用卡片点击回调');
       console.warn('   → 用户可通过回复选项编号完成选择');
-    } else if (text.includes('error') || text.includes('Error')) {
-      console.error('卡片监听器错误:', text);
     }
   });
   
   cardListenerProcess.on('close', (code) => {
     console.log(`卡片监听器退出，代码: ${code}`);
+    
+    // 退出时再次检查 stderr 缓冲区
+    if (code === 2 && isStaleConsumerError(cardStderrBuffer)) {
+      cardStaleConsumer = true;
+      console.log('⚠️ 退出时检测到残留消费者注册');
+    }
+    
     if (code !== 0 && !cardListenerDisabled) {
       if (cardStaleConsumer && !busResetDone) {
         cardStaleConsumer = false;
@@ -182,8 +243,13 @@ function startCardListener() {
  * 启动所有监听器
  */
 function startListener(onMessage) {
-  startMessageListener(onMessage);
-  startCardListener();
+  // 启动前先清理总线上的孤儿消费者，避免消息被重复消费（重复发送卡片）
+  cleanupOrphanConsumers();
+  // 稍等总线完全停止后再注册新消费者
+  setTimeout(() => {
+    startMessageListener(onMessage);
+    startCardListener();
+  }, 1500);
 }
 
 /**
@@ -269,6 +335,13 @@ async function handleMessage(event, onMessage) {
     const messageType = message.message_type;
     const messageId = message.message_id;
     
+    // 去重：同一条消息可能被多个消费者/重复投递，按 event_id 或 message_id 去重
+    const dedupKey = event.event_id || event.event?.event_id || message.event_id || messageId;
+    if (isDuplicateEvent(dedupKey)) {
+      console.log(`[去重] 跳过重复消息 (key=${dedupKey})`);
+      return;
+    }
+    
     // 解析消息内容
     let content;
     try {
@@ -291,6 +364,13 @@ async function handleMessage(event, onMessage) {
       }
       console.log(`收到图片消息: image_key=${imageKey} (chat: ${chatId})`);
       if (imageKey && messageId) {
+        // 旧流程卡在等待选择时，发截图视为新需求，自动中止旧会话
+        const existingImg = cursorRunner.getSession(chatId);
+        if (existingImg && ['running', 'waiting_choice'].includes(existingImg.status)) {
+          cursorRunner.stopSession(chatId);
+          larkClient.clearProgressCardId(chatId);
+          await larkClient.sendTextMessage(chatId, '🔄 已中止上一轮流程，开始处理新需求…');
+        }
         await handleRequirementImage(chatId, messageId, imageKey);
       } else {
         await larkClient.sendTextMessage(chatId, '❌ 未能识别图片，请重试或改用文字/链接。');
@@ -352,43 +432,68 @@ async function handleMessage(event, onMessage) {
     // 优先处理：当前会话正在等待用户输入
     const session = cursorRunner.getSession(chatId);
     if (session && session.status === 'waiting_choice' && session.pendingChoice) {
-      const pending = session.pendingChoice;
-      
-      // 特殊：等待自由文本输入（如 Figma 链接）
-      if (pending.type === 'figma_url' || (pending.options || []).length === 0) {
-        cursorRunner.resolveUserChoice(chatId, text);
-        return;
-      }
-      
-      const options = pending.options;
-      const num = parseInt(text, 10);
-      let chosen = null;
-      
-      if (!isNaN(num) && num >= 1 && num <= options.length) {
-        chosen = options[num - 1].value;
+      // 僵尸等待：超时后 pendingChoice 未清干净，或 Promise 已失效 → 清掉后按新消息处理
+      if (!cursorRunner.hasPendingChoice(chatId)) {
+        console.warn(`⚠️ 清理僵尸 waiting_choice 会话 (chat: ${chatId})`);
+        cursorRunner.clearWaitingChoice(chatId, 'error');
+        // 不 return，继续走下方新需求识别
       } else {
-        // 尝试文本匹配
-        const matched = options.find(o => 
-          o.text === text || o.value === text || o.text.includes(text)
-        );
-        if (matched) chosen = matched.value;
-      }
-      
-      if (chosen) {
-        const resolved = cursorRunner.resolveUserChoice(chatId, chosen);
-        if (resolved) {
-          const updated = await larkClient.markChoiceCardSelected(chatId, chosen);
-          if (!updated) {
-            await larkClient.sendTextMessage(chatId, `✅ 已收到选择：${chosen}`);
-          }
+        const pending = session.pendingChoice;
+
+        // 等待自由文本输入（Figma/Web URL、账号等）时，任何回复都应记录为答案。
+        // 这类消息常是飞书分享卡片文本，不能先按“新需求”误判。
+        if (isFreeTextPending(pending)) {
+          cursorRunner.resolveUserChoice(chatId, text);
           return;
         }
-      } else {
-        await larkClient.sendTextMessage(
-          chatId,
-          `请回复有效的选项编号（1-${options.length}）`
-        );
-        return;
+
+        // 用户发了新需求（链接/单模块命令/长需求正文）→ 中止旧流程并重新开始
+        if (looksLikeNewRequirement(text)) {
+          console.log(`🔄 等待选择中收到新需求，自动停止旧流程 (chat: ${chatId})`);
+          cursorRunner.stopSession(chatId);
+          larkClient.clearProgressCardId(chatId);
+          await larkClient.sendTextMessage(chatId, '🔄 已中止上一轮流程，开始处理新需求…');
+          // 不 return，继续走下方新需求识别
+        } else {
+          // 无固定选项的等待（如核验继续）仍支持任意回复
+          if ((pending.options || []).length === 0) {
+            cursorRunner.resolveUserChoice(chatId, text);
+            return;
+          }
+
+          const options = pending.options;
+          const num = parseInt(text, 10);
+          let chosen = null;
+
+          if (!isNaN(num) && num >= 1 && num <= options.length) {
+            chosen = options[num - 1].value;
+          } else {
+            // 尝试文本匹配
+            const matched = options.find(o =>
+              o.text === text || o.value === text || o.text.includes(text)
+            );
+            if (matched) chosen = matched.value;
+          }
+
+          if (chosen) {
+            const resolved = cursorRunner.resolveUserChoice(chatId, chosen);
+            if (resolved) {
+              const updated = await larkClient.markChoiceCardSelected(chatId, chosen);
+              if (!updated) {
+                await larkClient.sendTextMessage(chatId, `✅ 已收到选择：${chosen}`);
+              }
+              return;
+            }
+            // resolve 失败：清僵尸状态后按新消息处理
+            cursorRunner.clearWaitingChoice(chatId, 'error');
+          } else {
+            await larkClient.sendTextMessage(
+              chatId,
+              `请回复有效的选项编号（1-${options.length}），或直接发送新的需求链接/内容重新开始。`
+            );
+            return;
+          }
+        }
       }
     }
     
@@ -598,6 +703,44 @@ function isLikelyRequirement(text) {
 }
 
 /**
+ * 这些等待项本来就需要用户发送自由文本，不能被“新需求识别”抢先拦截。
+ */
+function isFreeTextPending(pending) {
+  const freeTextTypes = new Set([
+    'figma_url',
+    'web_url',
+    'account',
+    'app_id',
+    'install_path',
+  ]);
+  return freeTextTypes.has(pending?.type);
+}
+
+/**
+ * 等待选择时，判断用户是否在发「新需求」而非回答当前选项
+ * 命中后应中止旧流程并重新开始，避免把需求正文当成选项编号
+ */
+function looksLikeNewRequirement(text) {
+  const t = (text || '').trim();
+  if (!t) return false;
+
+  // 需求链接
+  const urls = t.match(/(https?:\/\/[^\s]+)/g);
+  if (urls && urls.some((u) => isRequirementUrl(u))) return true;
+
+  // 单模块命令（生成用例 / 分析需求 / 生成自动化）
+  const mode = detectMode(t);
+  if (mode.targetPhase !== 'full') return true;
+
+  // 明显的新需求正文（较长，且不是短选项词）
+  const shortOpt = ['有', '无', '需要', '不需要', '跳过', '继续', 'web', 'ios', 'android'];
+  if (shortOpt.includes(t.toLowerCase())) return false;
+  if (/^\d{1,2}$/.test(t)) return false; // 纯编号仍当选项
+
+  return isLikelyRequirement(t);
+}
+
+/**
  * 检查是否是停止命令
  */
 function isStopCommand(text) {
@@ -633,14 +776,17 @@ async function askChoice(session, { type, title, question, options }) {
   session.status = 'waiting_choice';
   session.pendingChoice = { type, question, options };
   
-  await larkClient.sendInteractiveCard(chatId, title, question, options, 'user_choice');
-  
-  const choice = await cursorRunner.waitForUserChoice(chatId);
-  
-  session.pendingChoice = null;
-  session.status = 'running';
-  
-  return choice;
+  try {
+    await larkClient.sendInteractiveCard(chatId, title, question, options, 'user_choice');
+    const choice = await cursorRunner.waitForUserChoice(chatId);
+    session.pendingChoice = null;
+    session.status = 'running';
+    return choice;
+  } catch (error) {
+    // 超时/中止：确保不会残留 waiting_choice，否则后续新需求会被当成选项
+    cursorRunner.clearWaitingChoice(chatId, session.aborted ? 'cancelled' : 'error');
+    throw error;
+  }
 }
 
 /**
@@ -655,9 +801,15 @@ async function askText(session, { type, title, question, allowSkip = true }) {
   
   session.status = 'waiting_choice';
   session.pendingChoice = { type, question, options: [] };
-  const answer = (await cursorRunner.waitForUserChoice(chatId)) || '';
-  session.pendingChoice = null;
-  session.status = 'running';
+  let answer = '';
+  try {
+    answer = (await cursorRunner.waitForUserChoice(chatId)) || '';
+    session.pendingChoice = null;
+    session.status = 'running';
+  } catch (error) {
+    cursorRunner.clearWaitingChoice(chatId, session.aborted ? 'cancelled' : 'error');
+    throw error;
+  }
   
   const t = answer.trim().toLowerCase();
   if (allowSkip && ['跳过', '无', '没有', 'skip', 'none', '不需要'].includes(t)) {
@@ -696,11 +848,16 @@ async function runPreflight(session) {
     // 等待用户发送 figma 链接（复用选择等待机制，任意文本都会被当作链接）
     session.status = 'waiting_choice';
     session.pendingChoice = { type: 'figma_url', question: '请发送Figma链接', options: [] };
-    const figmaUrl = await cursorRunner.waitForUserChoice(chatId);
-    session.figmaUrl = figmaUrl;
-    session.pendingChoice = null;
-    session.status = 'running';
-    await larkClient.sendTextMessage(chatId, `✅ 已记录 Figma 链接`);
+    try {
+      const figmaUrl = await cursorRunner.waitForUserChoice(chatId);
+      session.figmaUrl = figmaUrl;
+      session.pendingChoice = null;
+      session.status = 'running';
+      await larkClient.sendTextMessage(chatId, `✅ 已记录 Figma 链接`);
+    } catch (error) {
+      cursorRunner.clearWaitingChoice(chatId, session.aborted ? 'cancelled' : 'error');
+      throw error;
+    }
   }
   
   // Q2: 是否需要人工核验测试用例（决定流程是否在生成用例后暂停）
@@ -888,14 +1045,12 @@ async function runAutomationPreflight(session) {
  */
 async function handleRequirement(chatId, requirement) {
   try {
-    // 已有进行中的会话时，避免重复启动
+    // 已有进行中的会话：自动中止后开新流程（超时僵尸 / 用户重发需求）
     const existing = cursorRunner.getSession(chatId);
-    if (existing && ['running', 'waiting_choice'].includes(existing.status)) {
-      await larkClient.sendTextMessage(
-        chatId,
-        '⚠️ 已有正在进行的测试流程。如需重新开始，请先发送"停止"。'
-      );
-      return;
+    if (existing && ['running', 'waiting_choice', 'pending'].includes(existing.status)) {
+      console.log(`🔄 handleRequirement: 中止旧会话 status=${existing.status} (chat: ${chatId})`);
+      cursorRunner.stopSession(chatId);
+      larkClient.clearProgressCardId(chatId);
     }
     
     // 创建测试会话
@@ -936,10 +1091,13 @@ async function handleRequirement(chatId, requirement) {
       } catch (error) {
         if (error.name === 'AbortError' || session.status === 'cancelled') {
           console.log('流程已被用户停止');
+          cursorRunner.clearWaitingChoice(chatId, 'cancelled');
           return;
         }
         console.error('测试流程执行失败:', error);
-        await larkClient.sendTextMessage(chatId, `❌ 流程中断: ${error.message}`);
+        cursorRunner.clearWaitingChoice(chatId, 'error');
+        larkClient.clearProgressCardId(chatId);
+        await larkClient.sendTextMessage(chatId, `❌ 流程中断: ${error.message}\n可直接发送新的需求链接/内容重新开始。`);
       }
     })();
     
@@ -1159,10 +1317,13 @@ async function runTestFlowWithCallbacks(session) {
           return;
         }
         
-        // 提取并记录Bug
-        const bugs = cursorRunner.extractBugsFromResults(results || {});
+        // 提取并记录Bug（从 defects.json 和 Playwright 报告）
+        const bugs = cursorRunner.extractBugsFromResults(results || {}, session);
         if (bugs.length > 0) {
+          console.log(`[反馈] 将 ${bugs.length} 个缺陷写入飞书多维表格`);
           await larkClient.createBugRecords(bugs);
+        } else {
+          console.log('[反馈] 未检测到缺陷');
         }
         const bugBaseUrl = config.bugTable.baseToken
           ? `https://${config.lark.tenantDomain}/base/${config.bugTable.baseToken}`
@@ -1201,19 +1362,41 @@ async function runTestFlowWithCallbacks(session) {
 }
 
 /**
+ * 杀掉进程及其子进程树（Windows 下 spawn shell:true 会产生子进程，
+ * 直接 kill 父进程不会终止 lark-cli consume 子进程，需按进程树终止）
+ */
+function killProcessTree(proc) {
+  if (!proc || proc.killed) return;
+  try {
+    if (process.platform === 'win32') {
+      execSync(`taskkill /pid ${proc.pid} /T /F`, { stdio: 'ignore' });
+    } else {
+      proc.kill('SIGTERM');
+    }
+  } catch (e) {
+    // 进程可能已退出
+    try { proc.kill(); } catch { /* ignore */ }
+  }
+}
+
+/**
  * 停止所有监听器
  */
 function stopListener() {
   if (messageListenerProcess) {
-    messageListenerProcess.kill();
+    killProcessTree(messageListenerProcess);
     messageListenerProcess = null;
     console.log('消息监听器已停止');
   }
   if (cardListenerProcess) {
-    cardListenerProcess.kill();
+    killProcessTree(cardListenerProcess);
     cardListenerProcess = null;
     console.log('卡片监听器已停止');
   }
+  // 兜底：强制停止事件总线，确保无孤儿消费者残留
+  try {
+    execSync('lark-cli event stop --force', { shell: true, stdio: 'ignore' });
+  } catch { /* ignore */ }
 }
 
 module.exports = {

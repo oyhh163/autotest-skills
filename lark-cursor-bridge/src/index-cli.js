@@ -34,8 +34,34 @@ function checkSingleInstance() {
       // 锁文件损坏，忽略
     }
   }
+  // 兜底：终止任何遗留的 index-cli 服务进程（锁文件可能被误删，导致多实例并存）
+  terminateOrphanServices();
   // 写入当前进程PID
   fs.writeFileSync(lockFile, String(process.pid), 'utf8');
+}
+
+/**
+ * 查找并终止其它正在运行的 index-cli 服务进程（不含当前进程）
+ * 防止多个服务实例同时消费消息，导致重复回复
+ */
+function terminateOrphanServices() {
+  if (process.platform !== 'win32') return;
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync(
+      'powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name=\'node.exe\'\\" | Where-Object { $_.CommandLine -like \'*index-cli*\' } | Select-Object -ExpandProperty ProcessId"',
+      { encoding: 'utf8' }
+    );
+    const pids = out.split(/\r?\n/).map(s => parseInt(s.trim(), 10)).filter(p => p && p !== process.pid);
+    for (const pid of pids) {
+      try {
+        execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' });
+        console.log(`⚠️ 已终止遗留服务进程 PID ${pid}`);
+      } catch { /* 已退出 */ }
+    }
+  } catch (e) {
+    // 查询失败不阻塞启动
+  }
 }
 
 function isProcessAlive(pid) {

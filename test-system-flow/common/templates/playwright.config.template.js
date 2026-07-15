@@ -37,8 +37,8 @@ module.exports = defineConfig({
     channel: 'msedge',  // 使用Edge浏览器
     headless: false,    // 显示浏览器窗口
     
-    // 截图和录像
-    screenshot: 'only-on-failure',
+    // 截图和录像：screenshot 'on' 表示每个用例（含通过）都截图
+    screenshot: 'on',
     video: 'retain-on-failure',
     trace: 'retain-on-failure',
     

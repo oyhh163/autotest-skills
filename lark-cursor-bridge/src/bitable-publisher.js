@@ -218,13 +218,13 @@ async function createTestCaseBitable(cli, { projectName, smokeCases = [], detail
     written += batch.length;
   }
 
-  // 5. 设置为租户内可访问（失败不影响返回链接）
+  // 5. 设置为租户内可编辑（失败不影响返回链接）
   try {
     await cli.drive.permissionPublic.patch({
       path: { token: appToken },
       params: { type: 'bitable' },
       data: {
-        link_share_entity: 'tenant_readable',
+        link_share_entity: 'tenant_editable',
         external_access_entity: 'closed',
       },
     });

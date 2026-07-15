@@ -124,12 +124,33 @@ function resolveUserChoice(chatId, choice) {
 }
 
 /**
+ * 清理会话的「等待用户选择」状态（超时/中断后必须调用，避免僵尸 waiting_choice）
+ */
+function clearWaitingChoice(chatId, nextStatus = 'error') {
+  const session = activeSessions.get(chatId);
+  if (!session) return;
+  session.pendingChoice = null;
+  if (['waiting_choice', 'running', 'pending'].includes(session.status)) {
+    session.status = nextStatus;
+  }
+}
+
+/**
+ * 当前会话是否仍在真正等待用户选择（有未完成的 Promise）
+ */
+function hasPendingChoice(chatId) {
+  return pendingChoiceResolvers.has(chatId);
+}
+
+/**
  * 等待用户选择
  */
 function waitForUserChoice(chatId, timeoutMs = 300000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingChoiceResolvers.delete(chatId);
+      // 超时后立刻清掉 waiting 状态，否则后续新需求会被当成选项编号
+      clearWaitingChoice(chatId, 'error');
       reject(new Error('等待用户选择超时'));
     }, timeoutMs);
     
@@ -157,6 +178,7 @@ function stopSession(chatId) {
   
   session.aborted = true;
   session.status = 'cancelled';
+  session.pendingChoice = null;
   
   // 如果正在等待用户选择，用中止错误结束等待
   const resolver = pendingChoiceResolvers.get(chatId);
@@ -506,25 +528,70 @@ function buildAutomationSection(session, platform) {
   const a = session.automation;
   if (!a) return '自动化: 未配置（如需执行请按默认准备脚本，不主动执行）';
   
+  // 断言规范（必须严格遵守）
+  const assertionRules = `
+【断言规范 - 必须严格遵守】
+生成自动化脚本时，必须按以下六类场景编写【精准断言】，禁止只用 toBeVisible()：
+
+1. P0核心场景：必须断言业务结果（如 toHaveURL、toHaveText、元素状态）
+2. 文案校验：必须用 toHaveText(预期文案) 或 toContainText，预期值来自 Figma/需求文档
+3. 跳转校验：
+   - 有明确URL → expect(page).toHaveURL('xxx')
+   - 无明确URL → expect(目标页面元素).toBeVisible() + toHaveText(标题)
+4. 按钮状态校验：必须用 toBeDisabled() 或 toBeEnabled()，不能只检查可见性
+5. 数据校验：必须断言计算/展示值 === 预期值，如 toHaveText('¥100.00')
+6. 异常提示校验：必须断言 错误元素.toBeVisible() + toHaveText(预期错误文案)
+
+【禁止以下弱断言】：
+- 只写 await expect(element).toBeVisible() 就结束
+- 用 console.log('通过') 代替真实断言
+- 断言注释掉或留空
+- 断言与测试用例预期结果不对应
+
+【严格断言 - 禁止 fallback 兜底】：
+- 禁止用 if (可见) {断言A} else {断言B} 这种 fallback 逻辑绕过失败
+- 每条用例只针对需求描述的【那一个预期结果】做断言；预期的元素/文案没出现就应当真实失败
+- 例："空输入点击搜索展示下拉框"→ 必须断言下拉框出现，不能因为下拉框没出现就退而检查热搜项让用例通过
+- 不要用 .catch(() => false)、try/catch 吞掉断言错误
+- 不要为了让用例通过而放宽断言条件
+
+【截图要求】：
+- playwright.config.js 中设置 screenshot: 'on'，让每个用例（含通过）都保存截图，便于用户查看执行过程
+- 关键操作步骤后可调用 page.screenshot() 手动补充截图
+
+【断言来源】：
+- 预期值必须来自：需求文档、Figma 设计稿、测试用例的"预期结果"字段
+- 生成脚本前先从 test-cases.xlsx 读取每条用例的预期结果，作为断言依据
+
+【执行次数 - 必须严格遵守】：
+- 整套自动化只允许完整执行 1 次（npx playwright test / 等价命令只调用一次）
+- 生成脚本时尽量写对；可用断言质量静态检查，但不要用「先跑再改」代替
+- 执行一次后：解析报告 → 失败记 Bug → 进入汇总，立即收尾
+- 禁止：失败后改脚本/放宽断言再跑、修绿循环直到全通
+- playwright.config 中 retries 保持 0，不要为修绿开启重试
+- 例外：仅命令未真正启动（配置路径错误、依赖未装导致立刻退出）时可修环境后再启动一次；业务断言失败不算例外`;
+
   if (a.mode === 'prepare') {
-    return '自动化: 仅生成自动化脚本，【不要执行】自动化。生成脚本后即进入 Bug 汇总阶段。';
+    return `自动化: 仅生成自动化脚本，【不要执行】自动化。生成脚本后即进入 Bug 汇总阶段。
+${assertionRules}`;
   }
   
-  const lines = ['自动化: 生成后【立即执行】UI自动化。以下配置已由用户确认，勿再询问：'];
+  const lines = ['自动化: 生成后【立即执行】UI自动化（整套只跑 1 次）。以下配置已由用户确认，勿再询问：'];
   if (platform === 'Web') {
     lines.push(`- 被测URL: ${a.webUrl || '(未提供)'}`);
     lines.push(`- 登录方式: ${a.loginMode === 'account' ? `账号密码登录，账号信息: ${a.account || '(未提供)'}` : '无需登录'}`);
     lines.push(`- 目标浏览器: ${a.browser || 'msedge'}`);
     lines.push(`- 网络/API: ${a.mock === 'mock' ? '允许 mock' : '走真实接口'}`);
-    lines.push('请使用公共模块 Playwright 模板，按上述配置生成并运行自动化脚本。');
+    lines.push('请使用公共模块 Playwright 模板，按上述配置生成并【只运行一次】自动化脚本；失败记 Bug，禁止修绿重跑。');
   } else {
     lines.push(`- 平台: ${platform}`);
     lines.push(`- 应用标识(包名/BundleID): ${a.appId || '(未提供)'}`);
     lines.push(`- 设备类型: ${a.deviceType === 'real' ? '真机' : '模拟器'}`);
     if (a.installPath) lines.push(`- 安装包路径: ${a.installPath}`);
     if (a.account) lines.push(`- 登录账号: ${a.account}`);
-    lines.push('请使用 Appium 生成并（在环境支持时）运行自动化脚本；环境不支持时生成就绪脚本并说明缺少什么。');
+    lines.push('请使用 Appium 生成并（在环境支持时）【只运行一次】自动化脚本；失败记 Bug，禁止修绿重跑；环境不支持时生成就绪脚本并说明缺少什么。');
   }
+  lines.push(assertionRules);
   return lines.join('\n');
 }
 
@@ -661,24 +728,135 @@ function detectCompletion(text) {
 }
 
 /**
- * 提取Bug
+ * 提取Bug（从 defects.json 和 Playwright JSON 报告）
  */
-function extractBugsFromResults(results) {
+function extractBugsFromResults(results, session = {}) {
   const bugs = [];
   
-  if (results.outputDir) {
-    const defectFile = path.join(results.outputDir, 'defects.json');
-    if (fs.existsSync(defectFile)) {
+  if (!results.outputDir) {
+    return bugs;
+  }
+  
+  // 1. 尝试读取 Cursor 生成的 defects.json
+  const defectFile = path.join(results.outputDir, 'defects.json');
+  if (fs.existsSync(defectFile)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(defectFile, 'utf8'));
+      bugs.push(...data);
+      console.log(`[Bug提取] 从 defects.json 读取到 ${data.length} 个缺陷`);
+    } catch (e) {
+      console.error('解析缺陷文件失败:', e);
+    }
+  }
+  
+  // 2. 解析 Playwright JSON 报告，提取失败用例作为 Bug
+  const playwrightReportPaths = [
+    path.join(results.outputDir, 'reports', 'results.json'),
+    path.join(results.outputDir, 'test-results.json'),
+    path.join(results.outputDir, 'playwright-report', 'results.json'),
+  ];
+  
+  for (const reportPath of playwrightReportPaths) {
+    if (fs.existsSync(reportPath)) {
       try {
-        const data = JSON.parse(fs.readFileSync(defectFile, 'utf8'));
-        bugs.push(...data);
+        const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+        const failedTests = extractFailedTestsFromReport(report);
+        
+        if (failedTests.length > 0) {
+          console.log(`[Bug提取] 从 Playwright 报告读取到 ${failedTests.length} 个失败用例`);
+          
+          // 转换为 Bug 格式，避免重复（按标题去重）
+          const existingTitles = new Set(bugs.map(b => b.title));
+          
+          for (const test of failedTests) {
+            const bugTitle = `[自动化失败] ${test.title}`;
+            if (!existingTitles.has(bugTitle)) {
+              bugs.push({
+                id: `BUG-AUTO-${Date.now()}-${bugs.length + 1}`,
+                title: bugTitle,
+                source: '自动化测试',
+                caseId: test.id || test.title,
+                severity: 'P1',
+                status: '待处理',
+                description: formatBugDescription(test),
+                platform: session.platform || 'Web',
+                browser: session.automation?.browser || '未知',
+                url: session.automation?.webUrl || '',
+                createdAt: new Date().toISOString(),
+              });
+              existingTitles.add(bugTitle);
+            }
+          }
+        }
+        break; // 找到一个报告就停止
       } catch (e) {
-        console.error('解析缺陷文件失败:', e);
+        console.error(`解析 Playwright 报告失败 (${reportPath}):`, e.message);
       }
     }
   }
   
+  console.log(`[Bug提取] 共提取 ${bugs.length} 个缺陷`);
   return bugs;
+}
+
+/**
+ * 从 Playwright 报告中提取失败的测试
+ */
+function extractFailedTestsFromReport(report) {
+  const failed = [];
+  
+  function traverseSuites(suites) {
+    for (const suite of suites || []) {
+      // 处理 specs
+      for (const spec of suite.specs || []) {
+        for (const test of spec.tests || []) {
+          if (test.status === 'unexpected' || test.status === 'failed') {
+            const lastResult = (test.results || []).slice(-1)[0] || {};
+            failed.push({
+              id: spec.id || spec.title,
+              title: spec.title,
+              fullTitle: `${suite.title} > ${spec.title}`,
+              status: test.status,
+              duration: lastResult.duration || 0,
+              error: lastResult.error || null,
+              retries: (test.results || []).length - 1,
+            });
+          }
+        }
+      }
+      // 递归处理子套件
+      if (suite.suites) {
+        traverseSuites(suite.suites);
+      }
+    }
+  }
+  
+  traverseSuites(report.suites);
+  return failed;
+}
+
+/**
+ * 格式化 Bug 描述
+ */
+function formatBugDescription(test) {
+  let desc = `**测试用例**: ${test.fullTitle || test.title}\n\n`;
+  
+  if (test.error) {
+    desc += `**错误信息**:\n\`\`\`\n${test.error.message || '未知错误'}\n\`\`\`\n\n`;
+    if (test.error.stack) {
+      // 只取堆栈的前几行
+      const stackLines = test.error.stack.split('\n').slice(0, 5).join('\n');
+      desc += `**堆栈**:\n\`\`\`\n${stackLines}\n\`\`\`\n\n`;
+    }
+  }
+  
+  if (test.retries > 0) {
+    desc += `**重试次数**: ${test.retries}\n`;
+  }
+  
+  desc += `**执行时长**: ${test.duration || 0}ms`;
+  
+  return desc;
 }
 
 module.exports = {
@@ -687,6 +865,8 @@ module.exports = {
   updateSession,
   resolveUserChoice,
   waitForUserChoice,
+  clearWaitingChoice,
+  hasPendingChoice,
   stopSession,
   runTestFlow,
   extractBugsFromResults,

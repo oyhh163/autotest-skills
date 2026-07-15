@@ -455,15 +455,160 @@ await common.generateXMindFromTestCases({ projectName, outputDir, smokeCases, de
    - **异常提示**：输入异常值后断言错误提示
 6. 运行自动化并收集结构化结果。
 
+### 自动化执行次数（必须严格遵守）
+
+**整套自动化套件只允许完整执行 1 次**（例如 `npx playwright test` / Appium 等价命令只调用一次）：
+
+1. **生成脚本时尽量写对**：选择器、断言、URL 在首次执行前完成；可用静态检查（断言质量校验）提前发现问题，但不要用「先跑一遍再改」代替。
+2. **执行一次后立即收尾**：无论通过还是失败，都解析报告 → 失败用例记为 Bug → 进入缺陷汇总，然后输出完成标记。
+3. **禁止修绿重跑循环**：
+   - 禁止因失败而修改脚本后再执行 `playwright test` / 等价命令
+   - 禁止「失败 → 改断言/选择器 → 再跑 → 直到全绿」
+   - 禁止为提高通过率而放宽断言后重跑
+4. **Playwright 配置**：`retries` 保持为 `0`（非 CI 默认即可），不要为修绿开启重试或 `repeatEach`。
+5. **例外**：仅当命令本身未真正跑起来（如配置文件路径错误、依赖未安装导致进程立刻退出）时，可修复环境问题后**再启动一次**；业务断言失败不属于此例外。
+
 对于App自动化用例：
 
 1. 询问用户包名或Bundle ID、平台（`Android` 或 `iOS`）、设备/模拟器信息、如需要提供应用安装路径、登录/测试账号。
 2. 创建或更新专用自动化模块。
 3. 当项目无标准时优先使用Appium。
 4. 根据自动化类型生成对应的测试脚本（同Web）。
-5. 当环境支持时通过包名/Bundle ID启动应用并运行自动化。
+5. 当环境支持时通过包名/Bundle ID启动应用并运行自动化（同样只完整执行 1 次，失败记 Bug，禁止修绿重跑）。
 
 如果当前环境无法运行UI自动化，仍然生成自动化就绪测试，并清楚说明缺少什么。
+
+### 断言编写规范（必须严格遵守）
+
+生成自动化脚本时，**必须**按以下规范编写精准断言，**禁止**只使用弱断言：
+
+#### 弱断言（禁止单独使用）
+
+以下断言仅检查元素存在性，不验证业务逻辑，不能作为唯一断言：
+
+```javascript
+// ❌ 禁止只写这些
+await expect(element).toBeVisible();
+await expect(element).toBeTruthy();
+await expect(element).toBeDefined();
+await expect(element).toBeAttached();
+```
+
+#### 强断言（必须使用）
+
+根据断言类型，选择对应的强断言方法：
+
+| 断言类型 | 推荐方法 | 示例 |
+|---------|---------|------|
+| 文案校验 | `toHaveText()` | `await expect(page.locator('h1')).toHaveText('登录');` |
+| 包含文案 | `toContainText()` | `await expect(el).toContainText('成功');` |
+| URL跳转 | `toHaveURL()` | `await expect(page).toHaveURL('/dashboard');` |
+| 禁用状态 | `toBeDisabled()` | `await expect(btn).toBeDisabled();` |
+| 启用状态 | `toBeEnabled()` | `await expect(btn).toBeEnabled();` |
+| 输入值 | `toHaveValue()` | `await expect(input).toHaveValue('test');` |
+| 属性值 | `toHaveAttribute()` | `await expect(el).toHaveAttribute('href', '/');` |
+| CSS类 | `toHaveClass()` | `await expect(el).toHaveClass(/active/);` |
+| 数量 | `toHaveCount()` | `await expect(items).toHaveCount(5);` |
+| 精确相等 | `toBe()` | `expect(value).toBe(100);` |
+
+#### 按场景类型的断言要求
+
+1. **P0核心场景**：必须包含流程结果断言（URL变化、成功提示、数据展示）
+2. **文案校验**：必须用 `toHaveText(预期文案)`，预期值来自 Figma
+3. **跳转校验**：
+   - 有明确URL → `expect(page).toHaveURL('xxx')`
+   - 无明确URL → 目标页面元素可见 + 标题文案正确
+4. **按钮状态**：必须用 `toBeDisabled()` 或 `toBeEnabled()`
+5. **数据校验**：必须断言计算值/展示值 === 预期值
+6. **异常提示**：必须断言错误元素可见 + 错误文案匹配
+
+#### 禁止 fallback 兜底（严格断言）
+
+**禁止**为了让用例通过而放宽断言：
+
+```javascript
+// ❌ 禁止：fallback 兜底会掩盖真实失败
+const hasSuggest = await suggestBox.isVisible().catch(() => false);
+if (hasSuggest) {
+  expect(await items.count()).toBeGreaterThan(0);
+} else {
+  // 下拉框没出现就退而检查别的，让用例"假装"通过
+  expect(await otherItems.count()).toBeGreaterThan(0);
+}
+
+// ✅ 正确：需求要求什么就断言什么，没出现就真实失败
+await expect(suggestBox).toBeVisible();
+await expect(suggestItems.first()).not.toHaveText('');
+```
+
+- 禁止 `if (可见) {A} else {B}` 绕过失败
+- 禁止用 `.catch(() => false)`、`try/catch` 吞掉断言错误
+- 每条用例只针对需求描述的**那一个预期结果**做断言
+
+#### 截图配置（便于查看执行过程）
+
+`playwright.config.js` 中设置 `screenshot: 'on'`，让每个用例（含通过）都保存截图：
+
+```javascript
+use: {
+  screenshot: 'on',          // 每个用例都截图（含通过）
+  video: 'retain-on-failure', // 失败时保留录像
+  trace: 'retain-on-failure', // 失败时保留 trace，可用 npx playwright show-trace 回放
+  headless: true,             // 如需观察浏览器操作可设为 false
+}
+```
+
+- 如需**观察浏览器实时操作**，将 `headless` 设为 `false`
+- 关键步骤后可用 `await page.screenshot({ path: 'reports/screenshots/step-x.png' })` 手动补充
+
+#### 断言来源
+
+预期值必须来自：
+- 需求文档中的业务规则
+- Figma 设计稿中的文案
+- test-cases.xlsx 中的"预期结果"字段
+
+#### 断言质量校验
+
+生成脚本后，使用公共模块校验断言质量：
+
+```javascript
+const common = require('../common');
+const result = common.assertionValidator.validateAssertions('./tests');
+
+if (!result.passed) {
+  console.log('断言质量不合格:');
+  console.log(result.report);
+}
+```
+
+质量评分标准：
+- 强断言占比 ≥ 60% 为合格
+- 存在模板占位符未替换则不合格
+- 存在注释掉的断言则不合格
+
+### 测试结果解析
+
+执行自动化后，从 Playwright JSON 报告中提取真实结果：
+
+```javascript
+const common = require('../common');
+const results = common.reportParser.findAndParseReport('./');
+
+if (results.success) {
+  const summary = common.reportParser.generateSummary(results);
+  console.log(summary.message);  // "✅ 全部通过 (10/10)" 或 "❌ 存在失败 (...)"
+  
+  // 将失败用例转为 Bug 记录
+  if (summary.failedTests.length > 0) {
+    const bugs = common.reportParser.convertToBugRecords(summary.failedTests, {
+      platform: 'Web',
+      browser: 'Edge',
+      url: 'https://example.com'
+    });
+  }
+}
+```
 
 ## 阶段7：缺陷汇总Excel
 
@@ -573,7 +718,7 @@ common.generateAutomationReport({
 - `analyze` - 分析需求（解析文档、提取功能点）
 - `testcase` - 生成测试用例（生成冒烟+详细用例，导出Excel/XMind）
 - `autocase` - 生成自动化用例（筛选P0、文案、跳转等自动化候选）
-- `execute` - 执行自动化（运行Playwright等，显示通过数/总数）
+- `execute` - 执行自动化（运行Playwright等，显示通过数/总数；整套只跑 1 次，失败记 Bug，禁止修绿重跑）
 - `feedback` - 反馈Bug（汇总问题、记录到多维表格）
 
 **用户选择**（需要用户决策时使用）：
